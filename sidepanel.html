@@ -1,0 +1,59 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>GEDmatch Importer</title>
+    <style>
+      body { font-family: system-ui, sans-serif; margin: 8px; width: 100%; }
+      h1 { font-size: 16px; margin: 0 0 8px; }
+      .row { margin: 8px 0; }
+      input[type=file] { width: 100%; }
+      table { width: 100%; border-collapse: collapse; }
+      th, td { text-align: left; padding: 4px; font-size: 12px; }
+      tr:nth-child(even) { background: #f6f6f6; }
+      .btn { padding: 6px 10px; font-size: 12px; cursor: pointer; }
+      .btn-primary { background: #1a73e8; color: #fff; border: none; }
+      .btn-link { background: transparent; color: #1a73e8; border: none; padding: 0; }
+      .muted { color: #666; font-size: 12px; }
+      .list { max-height: 320px; overflow: auto; border: 1px solid #ddd; }
+      .controls { display: flex; gap: 8px; align-items: center; }
+      .pill { background: #eee; border-radius: 12px; padding: 2px 8px; font-size: 11px; }
+      .dot { display:inline-block; width:10px; height:10px; border-radius:50%; box-shadow: 0 0 0 1px rgba(0,0,0,0.2) inset; }
+      .dot.red { background:#e53935; }
+      .dot.yellow { background:#f9a825; }
+      .dot.green { background:#43a047; }
+    </style>
+  </head>
+  <body>
+    <h1>GEDmatch Importer</h1>
+    <div class="row">
+      <input id="csvFile" type="file" accept=".csv" />
+      <div class="muted">Load GEDmatch one-to-many CSV export</div>
+    </div>
+    <div class="row controls">
+      <button id="parseBtn" class="btn btn-primary">Parse CSV</button>
+      <span id="stats" class="pill">No file</span>
+    </div>
+    <div class="row">
+      <div class="muted">Rows with GED links</div>
+      <div class="list">
+        <table>
+          <thead>
+            <tr>
+              <th>Status</th>
+              <th>Kit</th>
+              <th>Name</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="row controls">
+      <button id="openNext" class="btn">Open Next</button>
+      <button id="exportJson" class="btn">Export JSON</button>
+    </div>
+    <script src="sidepanel.js"></script>
+  </body>
+</html>
