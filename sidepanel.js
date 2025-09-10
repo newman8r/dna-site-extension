@@ -385,6 +385,34 @@ function parseIndividualsFromPre(result){
   return { people, families, logs };
 }
 
+// Build intermediary JSON: one entry per row with tokens and detected persons
+function buildIntermediaryRows(result){
+  const text=(result.text||'').replace(/\u00a0/g,' ');
+  const lines=text.split(/\r?\n/);
+  let anchors=[];
+  if(Array.isArray(result.anchors)&&result.anchors.length){ anchors=result.anchors.map(a=>({ label:(a.label||'').trim(), href:a.href||'', color:(a.color||'').toLowerCase() })); }
+  else { const container=document.createElement('div'); container.innerHTML=result.html||''; anchors=Array.from(container.querySelectorAll('a')).map(a=>{ const font=a.querySelector('font'); return { label:(a.textContent||'').trim(), href:a.getAttribute('href')||'', color:(font?.getAttribute('color')||'').toLowerCase() }; }); }
+
+  function pairOutermost(lefts, rights){ const segs=[]; let li=0; let ri=rights.length-1; while(li<lefts.length && ri>=0){ const l=lefts[li]; while(ri>=0 && rights[ri]<=l) ri--; if(ri<0) break; const r=rights[ri--]; if(r>l) segs.push({ L:l, R:r, mid: Math.floor((l+r)/2) }); li++; } return segs; }
+
+  const rows=[]; let personLines=0; let charLines=0;
+  for(let i=0;i<lines.length;i++){
+    const s=lines[i];
+    // pipe scan for every row (both person and char rows can have pipes)
+    const rowPipes=[]; for(let c=0;c<s.length;c++){ if(s[c]==='|') rowPipes.push(c); }
+    // detect persons from anchors on this line
+    const persons=[]; for(const a of anchors){ if(!a.label) continue; const idx=s.indexOf(a.label); if(idx!==-1){ const parsed=parsePersonLabel(a.label); const sex=a.color==='red'?'F':a.color==='blue'?'M':'U'; const url=resolveGedUrl(a.href||''); const leadingSpaces=(s.match(/^\s*/)||[''])[0].length; const indent=Math.floor(leadingSpaces/2); persons.push({ label:a.label, name:parsed.name, birth:parsed.birth, death:parsed.death, sex, url, col:idx, indent, leadingSpaces }); } }
+    if(persons.length){
+      rows.push({ idx:i, type:'person', persons, text:s, pipes: rowPipes, pipeCount: rowPipes.length }); personLines++; continue;
+    }
+    // char row tokens
+    const pipes=[]; const lefts=[]; const rights=[]; for(let c=0;c<s.length;c++){ const ch=s[c]; if(ch==='|') pipes.push(c); else if(ch==='/') lefts.push(c); else if(ch==='\\') rights.push(c); }
+    const segments=pairOutermost(lefts, rights);
+    rows.push({ idx:i, type:'char', pipes, pipeCount: pipes.length, lefts, rights, segments, text:s }); charLines++;
+  }
+  return { totalLines: lines.length, personLines, charLines, rows };
+}
+
 // Pipe-reduction algorithm - processes from most pipes to least
 function parseIndividualsFromPreV2(result){
   const logs=[];
@@ -740,6 +768,363 @@ function parseIndividualsFromPreV3(result){
   return { people, families: mergedFamilies, logs };
 }
 
+// V5 Parser - Family reduction with robust segment pairing and orientation scoring
+function parseIndividualsFromPreV5(result){
+  const logs=[];
+  const text=(result.text||'').replace(/\u00a0/g,' ');
+  const lines=text.split(/\r?\n/);
+
+  // Anchors with sex/color and href
+  let anchors=[];
+  if(Array.isArray(result.anchors)&&result.anchors.length){
+    anchors=result.anchors.map(a=>({ label:(a.label||'').trim(), href:a.href||'', color:(a.color||'').toLowerCase() }));
+  } else {
+    const container=document.createElement('div'); container.innerHTML=result.html||'';
+    anchors=Array.from(container.querySelectorAll('a')).map(a=>{ const font=a.querySelector('font'); return { label:(a.textContent||'').trim(), href:a.getAttribute('href')||'', color:(font?.getAttribute('color')||'').toLowerCase() }; });
+  }
+
+  // Build people from anchors by locating labels in lines
+  const people=[];
+  const linePeople=new Map(); // line -> [{id,col,width}]
+  for(let i=0;i<lines.length;i++){
+    const s=lines[i];
+    for(const a of anchors){
+      const label=a.label; if(!label) continue;
+      const idx=s.indexOf(label);
+      if(idx!==-1){
+        const sex=a.color==='red'?'F':a.color==='blue'?'M':'U';
+        const url=resolveGedUrl(a.href||'');
+        const parsed=parsePersonLabel(label);
+        const id=people.length;
+        people.push({ id, sex, url, name: parsed.name, birth: parsed.birth, death: parsed.death, line:i, col:idx, width: label.length, indent:idx });
+        if(!linePeople.has(i)) linePeople.set(i, []);
+        linePeople.get(i).push({ id, col: idx, width: label.length });
+      }
+    }
+    if(linePeople.has(i)) linePeople.get(i).sort((a,b)=>a.col-b.col);
+  }
+
+  // Grid and tokenization
+  const maxLen=Math.max(0,...lines.map(l=>l.length));
+  const grid=lines.map(s=>s.padEnd(maxLen,' ').split(''));
+  function tokenizeRow(i){ const lefts=[]; const rights=[]; const pipes=[]; const row=grid[i]||[]; for(let c=0;c<row.length;c++){ const ch=row[c]; if(ch==='/' ) lefts.push(c); else if(ch==='\\') rights.push(c); else if(ch==='|') pipes.push(c); } return { lefts, rights, pipes }; }
+
+  // Pair segments on each slash row using stack (non-overlapping)
+  const segmentsByRow=new Map(); // row -> [{l,r,mid}]
+  for(let i=0;i<grid.length;i++){
+    const {lefts, rights}=tokenizeRow(i); if(!lefts.length && !rights.length) continue; if(!lefts.length || !rights.length) continue;
+    const segs=[]; const stack=[]; let ri=0;
+    // Build list of sorted positions with markers
+    const tokens=[...lefts.map(c=>({c,t:'L'})), ...rights.map(c=>({c,t:'R'}))].sort((a,b)=>a.c-b.c);
+    for(const tok of tokens){ if(tok.t==='L'){ stack.push(tok.c); } else { if(stack.length){ const l=stack.pop(); const r=tok.c; if(r>l){ segs.push({ l, r, mid: Math.floor((l+r)/2) }); } } } }
+    if(segs.length){ segmentsByRow.set(i, segs); logs.push({ type:'v5-segments', row:i, segs }); }
+  }
+
+  // Helpers to find nearest person above/below near a column
+  function personNearOnLine(i, col, tol){ const list=linePeople.get(i)||[]; let best=null, bestd=1e9; for(const p of list){ const center=p.col + (p.width||0)/2; const d=Math.abs(center-col); if(d<=tol && d<bestd){ best=p; bestd=d; } } return best?best.id:null; }
+  function findUp(i, col, tol, maxStep){ let steps=0; for(let r=i-1;r>=0 && steps++<(maxStep||40); r--){ const id=personNearOnLine(r,col,tol||12); if(id!=null) return id; } return null; }
+  function findDown(i, col, tol, maxStep){ let steps=0; for(let r=i+1;r<grid.length && steps++<(maxStep||40); r++){ const id=personNearOnLine(r,col,tol||12); if(id!=null) return id; } return null; }
+  function pipeScoreBelow(i, col, K){ let score=0; for(let k=1;k<=K && i+k<grid.length;k++){ const {pipes,lefts,rights}=tokenizeRow(i+k); if(pipes.some(pc=>Math.abs(pc-col)<=1)) score++; else if(lefts.some(l=>l<col)&&rights.some(r=>r>col)) score++; else break; } return score; }
+  function pipeScoreAbove(i, col, K){ let score=0; for(let k=1;k<=K && i-k>=0;k++){ const {pipes,lefts,rights}=tokenizeRow(i-k); if(pipes.some(pc=>Math.abs(pc-col)<=1)) score++; else if(lefts.some(l=>l<col)&&rights.some(r=>r>col)) score++; else break; } return score; }
+
+  const rawFamilies=[]; const childClaim=new Map(); // childId -> {row, dist}
+
+  // Evaluate each segment for orientation and build family
+  for(const [row, segs] of segmentsByRow.entries()){
+    for(const seg of segs){
+      const { l, r, mid }=seg;
+      // Scores
+      const downScore=pipeScoreBelow(row, mid, 8);
+      const upScore=pipeScoreAbove(row, mid, 8);
+
+      // Try parents-above, child-below
+      const pLeftUp=findUp(row, l, 14, 40);
+      const pRightUp=findUp(row, r, 14, 40);
+      const childDown=findDown(row, mid, 16, 40);
+
+      // Try parents-below, child-above
+      const pLeftDown=findDown(row, l, 14, 40);
+      const pRightDown=findDown(row, r, 14, 40);
+      const childUp=findUp(row, mid, 16, 40);
+
+      let orientation=null; let parents=[]; let child=null; let choiceLog={};
+      // Prefer orientation with valid trio and higher pipe score
+      const upValid=(pLeftUp!=null||pRightUp!=null)&&childDown!=null;
+      const downValid=(pLeftDown!=null||pRightDown!=null)&&childUp!=null;
+      if(upValid && !downValid){ orientation='up'; parents=[pLeftUp,pRightUp].filter(x=>x!=null); child=childDown; }
+      else if(!upValid && downValid){ orientation='down'; parents=[pLeftDown,pRightDown].filter(x=>x!=null); child=childUp; }
+      else if(upValid && downValid){ if(downScore>upScore){ orientation='down'; parents=[pLeftDown,pRightDown].filter(x=>x!=null); child=childUp; } else { orientation='up'; parents=[pLeftUp,pRightUp].filter(x=>x!=null); child=childDown; } }
+      else { // neither solid; skip
+        logs.push({ type:'v5-skip-seg', row, seg, reason:'no-valid-orientation', scores:{upScore,downScore}, candidates:{ pLeftUp,pRightUp,childDown,pLeftDown,pRightDown,childUp } });
+        continue;
+      }
+
+      // Claim child with closest mid distance if conflict
+      const childPos=(people.find(p=>p.id===child)||{}).col||mid; const dist=Math.abs(childPos-mid);
+      const prev=childClaim.get(child);
+      if(prev && prev.dist<=dist){ logs.push({ type:'v5-child-conflict-skip', row, seg, child, prev }); continue; }
+      childClaim.set(child, { row, dist });
+
+      const uniqParents=Array.from(new Set(parents)).slice(0,2);
+      if(!uniqParents.length){ logs.push({ type:'v5-no-parents', row, seg, child }); continue; }
+      rawFamilies.push({ parents: uniqParents, children:[child], row, orient: orientation });
+      logs.push({ type:'v5-family', row, seg, orientation, parents: uniqParents, child });
+    }
+  }
+
+  // Fallback: isolated single slashes as direct edges
+  for(let i=0;i<grid.length;i++){
+    if(segmentsByRow.has(i)) continue;
+    const { lefts, rights }=tokenizeRow(i);
+    for(const l of lefts){ const par=findUp(i,l,12,30); const ch=findDown(i,l-1,14,30) ?? findDown(i,l,12,30); if(par!=null && ch!=null){ rawFamilies.push({ parents:[par], children:[ch], row:i, orient:'single/' }); logs.push({ type:'v5-single', char:'/', row:i, par, ch }); } }
+    for(const r of rights){ const par=findDown(i,r,12,30); const ch=findUp(i,r-1,14,30) ?? findUp(i,r,12,30); if(par!=null && ch!=null){ rawFamilies.push({ parents:[par], children:[ch], row:i, orient:'single\\' }); logs.push({ type:'v5-single', char:'\\', row:i, par, ch }); } }
+  }
+
+  // Merge families by parent set and unique children
+  const famMap=new Map();
+  for(const fam of rawFamilies){ const key=(fam.parents||[]).slice().sort((a,b)=>a-b).join('|'); if(!famMap.has(key)) famMap.set(key,{ parents:(fam.parents||[]).slice(0,2), children:[] }); const dst=famMap.get(key); for(const c of fam.children||[]){ if(!dst.children.includes(c)) dst.children.push(c); } }
+  const families=[...famMap.values()];
+  logs.push({ type:'v5-summary', people:people.length, families:families.length });
+  return { people, families, logs };
+}
+
+// V6 Parser - Alternating CSV-style (person/connector) reduction using pipe order, not pixel columns
+function parseIndividualsFromPreV6(result){
+  const logs=[];
+  const text=(result.text||'').replace(/\u00a0/g,' ');
+  const lines=text.split(/\r?\n/);
+
+  // Extract anchors -> people with label positions; we'll still use label col to map person to nearest pipe order
+  let anchors=[];
+  if(Array.isArray(result.anchors)&&result.anchors.length){ anchors=result.anchors.map(a=>({ label:(a.label||'').trim(), href:a.href||'', color:(a.color||'').toLowerCase() })); }
+  else { const container=document.createElement('div'); container.innerHTML=result.html||''; anchors=Array.from(container.querySelectorAll('a')).map(a=>{ const font=a.querySelector('font'); return { label:(a.textContent||'').trim(), href:a.getAttribute('href')||'', color:(font?.getAttribute('color')||'').toLowerCase() }; }); }
+
+  // Build per-row tokens: pipe order indices, slash segments, and persons
+  const rowInfo=[]; // {i, pipes:[{idx,col}], slash:'/'|'\\'|'//\\'|'\\//', persons:[{id,col}]}
+  const people=[]; const linePeople=new Map();
+  for(let i=0;i<lines.length;i++){
+    const s=lines[i];
+    // Pipes with order index
+    const pipes=[]; let order=0; for(let c=0;c<s.length;c++){ if(s[c]==='|'){ pipes.push({ idx:order++, col:c }); } }
+    // Slashes
+    const lefts=[]; const rights=[]; for(let c=0;c<s.length;c++){ if(s[c]==='/') lefts.push(c); else if(s[c]==='\\') rights.push(c); }
+    let slashKind=null; if(lefts.length && rights.length) slashKind='J'; else if(lefts.length) slashKind='/'; else if(rights.length) slashKind='\\';
+    // Persons
+    const persons=[]; for(const a of anchors){ const idx=s.indexOf(a.label); if(idx!==-1){ const sex=a.color==='red'?'F':a.color==='blue'?'M':'U'; const url=resolveGedUrl(a.href||''); const parsed=parsePersonLabel(a.label); const id=people.length; people.push({ id, sex, url, name: parsed.name, birth: parsed.birth, death: parsed.death, line:i, col:idx }); persons.push({ id, col: idx }); if(!linePeople.has(i)) linePeople.set(i, []); linePeople.get(i).push({ id, col: idx }); } }
+    rowInfo.push({ i, text:s, pipes, lefts, rights, slashKind, persons });
+  }
+
+  // Helper: nearest person above/below by column, but scoring by pipe order index proximity
+  function nearestPersonUp(i, targetCol, tolCol){ for(let r=i-1;r>=0;r--){ const list=linePeople.get(r)||[]; if(list.length){ let best=null, bestd=1e9; for(const p of list){ const d=Math.abs(p.col-targetCol); if(d<bestd){ best=p; bestd=d; } } if(best && bestd<= (tolCol||32)) return best.id; } } return null; }
+  function nearestPersonDown(i, targetCol, tolCol){ for(let r=i+1;r<rowInfo.length;r++){ const list=linePeople.get(r)||[]; if(list.length){ let best=null, bestd=1e9; for(const p of list){ const d=Math.abs(p.col-targetCol); if(d<bestd){ best=p; bestd=d; } } if(best && bestd<= (tolCol||32)) return best.id; } } return null; }
+  function nearestPipeCol(i, col){ const ps=rowInfo[i]?.pipes||[]; if(!ps.length) return null; let best=ps[0].col, bestd=Math.abs(ps[0].col-col); for(const p of ps){ const d=Math.abs(p.col-col); if(d<bestd){ best=p.col; bestd=d; } } return best; }
+
+  // Build segments for junction rows using simple pairing
+  const segsByRow=new Map();
+  for(const row of rowInfo){ if(row.slashKind!=='J') continue; const segs=[]; let ri=0; for(const L of row.lefts){ while(ri<row.rights.length && row.rights[ri]<=L) ri++; if(ri>=row.rights.length) break; const R=row.rights[ri++]; const mid=Math.floor((L+R)/2); segs.push({ L, R, mid, Lp: nearestPipeCol(row.i,L), Rp: nearestPipeCol(row.i,R), Mp: nearestPipeCol(row.i,mid) }); } if(segs.length) segsByRow.set(row.i,segs); }
+
+  const families=[]; const childClaim=new Map();
+  // Process rows in descending pipe count for reduction-first semantics
+  const rowsByPipeCount=[...rowInfo].sort((a,b)=> (b.pipes.length)-(a.pipes.length));
+  for(const row of rowsByPipeCount){ if(row.slashKind!=='J') continue; const segs=segsByRow.get(row.i)||[]; for(const seg of segs){ const leftParent=nearestPersonUp(row.i, seg.Lp ?? seg.L, 28); const rightParent=nearestPersonUp(row.i, seg.Rp ?? seg.R, 28); const child=nearestPersonDown(row.i, seg.Mp ?? seg.mid, 32); if(child==null) { logs.push({ type:'v6-no-child', row:row.i, seg}); continue; } const prev=childClaim.get(child); const childCol=(people.find(p=>p.id===child)||{}).col||seg.mid; const dist=Math.abs(childCol-(seg.Mp??seg.mid)); if(prev && prev.dist<=dist){ logs.push({ type:'v6-child-conflict-skip', row:row.i, seg, child }); continue; } childClaim.set(child,{ row:row.i, dist }); const parents=[]; if(leftParent!=null) parents.push(leftParent); if(rightParent!=null && rightParent!==leftParent) parents.push(rightParent); if(!parents.length){ logs.push({ type:'v6-no-parents', row:row.i, seg, child}); continue; } const key=parents.slice().sort((a,b)=>a-b).join('|'); let fam=families.find(f=>f._key===key); if(!fam){ fam={ parents: parents.slice(0,2), children:[], _key:key }; families.push(fam); } if(!fam.children.includes(child)) fam.children.push(child); logs.push({ type:'v6-family', row:row.i, seg, parents: fam.parents, child }); }
+  }
+
+  // Fallback for single slashes
+  for(const row of rowInfo){ if(row.slashKind==='/'||row.slashKind==='\\'){ const cols=row.slashKind==='/'?row.lefts:row.rights; for(const c of cols){ const parent=row.slashKind==='/'?nearestPersonUp(row.i,c,28):nearestPersonDown(row.i,c,28); const child=row.slashKind==='/'?nearestPersonDown(row.i,c,28):nearestPersonUp(row.i,c,28); if(parent!=null && child!=null){ const key=[parent].join('|'); let fam=families.find(f=>f._key===key); if(!fam){ fam={ parents:[parent], children:[], _key:key }; families.push(fam); } if(!fam.children.includes(child)) fam.children.push(child); logs.push({ type:'v6-single', row:row.i, c, parent, child }); } } } }
+
+  // Strip helper props and return
+  families.forEach(f=>{ delete f._key; });
+  return { people, families, logs };
+}
+
+// V7 Parser - Indent-guided reduction into family units (adjacent 5-row and 3-row windows)
+function parseIndividualsFromPreV7(result){
+  const logs=[];
+  const text=(result.text||'').replace(/\u00a0/g,' ');
+  const lines=text.split(/\r?\n/);
+
+  // Anchors
+  let anchors=[];
+  if(Array.isArray(result.anchors)&&result.anchors.length){ anchors=result.anchors.map(a=>({ label:(a.label||'').trim(), href:a.href||'', color:(a.color||'').toLowerCase() })); }
+  else { const container=document.createElement('div'); container.innerHTML=result.html||''; anchors=Array.from(container.querySelectorAll('a')).map(a=>{ const font=a.querySelector('font'); return { label:(a.textContent||'').trim(), href:a.getAttribute('href')||'', color:(font?.getAttribute('color')||'').toLowerCase() }; }); }
+
+  // Build people and rows
+  const people=[]; const linePeople=new Map();
+  for(let i=0;i<lines.length;i++){
+    const s=lines[i];
+    for(const a of anchors){ const idx=s.indexOf(a.label); if(idx!==-1){ const sex=a.color==='red'?'F':a.color==='blue'?'M':'U'; const url=resolveGedUrl(a.href||''); const parsed=parsePersonLabel(a.label); const id=people.length; people.push({ id, sex, url, name: parsed.name, birth: parsed.birth, death: parsed.death, line:i, col:idx }); if(!linePeople.has(i)) linePeople.set(i, []); linePeople.get(i).push({ id, col: idx }); }}
+    if(linePeople.has(i)) linePeople.get(i).sort((a,b)=>a.col-b.col);
+  }
+
+  function tokenizeCharRow(i){ const s=lines[i]||''; const lefts=[]; const rights=[]; const pipes=[]; for(let c=0;c<s.length;c++){ const ch=s[c]; if(ch==='/' ) lefts.push(c); else if(ch==='\\') rights.push(c); else if(ch==='|') pipes.push(c); } return { lefts, rights, pipes }; }
+  function buildSegments(i){ const {lefts, rights}=tokenizeCharRow(i); if(!lefts.length||!rights.length) return []; const segs=[]; let rIdx=rights.length-1; for(const l of lefts){ while(rIdx>=0 && rights[rIdx]<=l) rIdx--; if(rIdx<0) break; const r=rights[rIdx--]; if(r>l) segs.push({ L:l, R:r, mid:Math.floor((l+r)/2) }); } return segs.sort((a,b)=>a.L-b.L); }
+  function personOnLineNear(i, col, tol){ const list=linePeople.get(i)||[]; if(!list.length) return null; let best=null, bestd=1e9; for(const p of list){ const d=Math.abs(p.col-col); if(d<bestd){ best=p; bestd=d; } } return bestd<=tol?best.id:null; }
+
+  // Build row objects
+  const rows=[]; for(let i=0;i<lines.length;i++){ if(linePeople.has(i)) rows.push({ idx:i, type:'person', persons: linePeople.get(i), text: lines[i] }); else { const t=tokenizeCharRow(i); const segs=buildSegments(i); const slashKind=(t.lefts.length&&t.rights.length)?'J':(t.lefts.length?'/':(t.rights.length?'\\':null)); rows.push({ idx:i, type:'char', pipes:t.pipes, lefts:t.lefts, rights:t.rights, segments:segs, slashKind, text: lines[i] }); }}
+
+  // Estimate indent per person row from first non-space column (fallback: person col / 4)
+  for(const row of rows){ if(row.type==='person'){ for(const p of row.persons){ const s=lines[row.idx]; const firstCol=(s.match(/^\s*/)[0]||'').length; const indent = Math.max(0, Math.floor((firstCol||p.col)/4)); p.indent=indent; const person=people.find(x=>x.id===p.id); if(person) person.indent=indent; } } }
+
+  const families=[]; const removedRow=new Set(); const claimedChild=new Set();
+
+  function addFamily(parents, child, context){ if(!parents.length||child==null) return false; const uniqParents=Array.from(new Set(parents)).slice(0,2); if(!uniqParents.length) return false; families.push({ parents: uniqParents, children:[child] }); logs.push({ type:'v7-family', ...context, parents: uniqParents, child }); return true; }
+
+  // Pass A: 5-row window reduction [parent]-[char]-[child]-[char]-[parent]
+  for(let i=0;i+4<rows.length;i++){
+    const r0=rows[i], r1=rows[i+1], r2=rows[i+2], r3=rows[i+3], r4=rows[i+4];
+    if(r0.type!=='person'||r1.type!=='char'||r2.type!=='person'||r3.type!=='char'||r4.type!=='person') continue;
+    if(!r1.segments.length || !r3.segments.length) continue;
+    // choose child (single person assumption)
+    const childId=(r2.persons[0]||{}).id; if(childId==null || claimedChild.has(childId)) continue;
+    const childCol=(r2.persons[0]||{}).col||0;
+    // pick nearest segments by midpoint
+    const segUp=r1.segments.reduce((b,s)=> !b||Math.abs(s.mid-childCol)<Math.abs(b.mid-childCol)?s:b, null);
+    const segDown=r3.segments.reduce((b,s)=> !b||Math.abs(s.mid-childCol)<Math.abs(b.mid-childCol)?s:b, null);
+    // resolve parents near L/R of each segment
+    const pUpLeft = personOnLineNear(r0.idx, segUp.L, 24);
+    const pDownRight = personOnLineNear(r4.idx, segDown.R, 24);
+    const parents=[]; if(pUpLeft!=null) parents.push(pUpLeft); if(pDownRight!=null && pDownRight!==pUpLeft) parents.push(pDownRight);
+    if(addFamily(parents, childId, { mode:'5row', rows:[r0.idx,r1.idx,r2.idx,r3.idx,r4.idx] })){
+      removedRow.add(r0.idx); removedRow.add(r4.idx); claimedChild.add(childId);
+    }
+  }
+
+  // Pass B: 3-row windows for single-parent edges above or below
+  for(let i=0;i+2<rows.length;i++){
+    const ra=rows[i], rb=rows[i+1], rc=rows[i+2];
+    if(ra.type==='person' && rb.type==='char' && rc.type==='person'){
+      const child=(rc.persons[0]||{}).id; if(child==null || claimedChild.has(child)) continue;
+      if(rb.lefts.length||rb.rights.length){
+        const nearL=rb.lefts.length?rb.lefts[0]:null; const nearR=rb.rights.length?rb.rights[rb.rights.length-1]:null; const parent = personOnLineNear(ra.idx, (nearL!=null?nearL:nearR), 24);
+        if(parent!=null){ if(addFamily([parent], child, { mode:'3row-above', rows:[ra.idx,rb.idx,rc.idx] })) { removedRow.add(ra.idx); claimedChild.add(child); } }
+      }
+    }
+    if(ra.type==='char' && rb.type==='person' && rc.type==='char'){
+      // symmetric case not needed for families; handled in 5-row
+    }
+    if(ra.type==='person' && rb.type==='char' && rc.type==='char'){
+      // skip
+    }
+    // Below: person(child) centered between char and person(parent)
+    if(ra.type==='person' && rb.type==='char' && rc.type==='person'){
+      // already covered
+    }
+  }
+
+  // Merge duplicates and ensure child links are unique
+  const famMap=new Map();
+  for(const fam of families){ const key=(fam.parents||[]).slice().sort((a,b)=>a-b).join('|'); if(!famMap.has(key)) famMap.set(key, { parents:(fam.parents||[]).slice(0,2), children:[] }); const dst=famMap.get(key); for(const c of fam.children||[]){ if(!dst.children.includes(c)) dst.children.push(c); } }
+  const outFamilies=[...famMap.values()];
+  logs.push({ type:'v7-summary', people: people.length, families: outFamilies.length });
+  return { people, families: outFamilies, logs };
+}
+
+// V4 Parser - Grid-based bidirectional tracing (/ \ |) into parent-child graph
+function parseIndividualsFromPreV4(result){
+  const logs=[];
+  const text=(result.text||'').replace(/\u00a0/g,' ');
+  const lines=text.split(/\r?\n/);
+
+  // Collect anchors with sex/color and href
+  let anchors=[];
+  if(Array.isArray(result.anchors)&&result.anchors.length){
+    anchors=result.anchors.map(a=>({ label:(a.label||'').trim(), href:a.href||'', color:(a.color||'').toLowerCase() }));
+  } else {
+    const container=document.createElement('div'); container.innerHTML=result.html||'';
+    anchors=Array.from(container.querySelectorAll('a')).map(a=>{ const font=a.querySelector('font'); return { label:(a.textContent||'').trim(), href:a.getAttribute('href')||'', color:(font?.getAttribute('color')||'').toLowerCase() }; });
+  }
+
+  // Index people by scanning anchors on their lines; record approximate label width
+  const people=[];
+  const linePeople=new Map(); // line -> [{id,col,width}]
+  for(let i=0;i<lines.length;i++){
+    const s=lines[i];
+    for(const a of anchors){
+      const label=a.label; if(!label) continue;
+      const idx=s.indexOf(label);
+      if(idx!==-1){
+        const sex=a.color==='red'?'F':a.color==='blue'?'M':'U';
+        const url=resolveGedUrl(a.href||'');
+        const parsed=parsePersonLabel(label);
+        const id=people.length;
+        people.push({ id, sex, url, name: parsed.name, birth: parsed.birth, death: parsed.death, line:i, col:idx, width: label.length, indent:idx });
+        if(!linePeople.has(i)) linePeople.set(i, []);
+        linePeople.get(i).push({ id, col: idx, width: label.length });
+      }
+    }
+    if(linePeople.has(i)) linePeople.get(i).sort((a,b)=>a.col-b.col);
+  }
+
+  // Build grid for connector tracing
+  const maxLen=Math.max(0,...lines.map(l=>l.length));
+  const grid=lines.map(s=>s.padEnd(maxLen,' ').split(''));
+
+  // Helpers
+  function personOnLineNear(lineIdx, col, tol){
+    const list=linePeople.get(lineIdx)||[]; let best=null, bestd=1e9;
+    for(const p of list){ const center=p.col + (p.width||0)/2; const d=Math.abs(center-col); if(d<=tol && d<bestd){ best=p; bestd=d; } }
+    return best?best.id:null;
+  }
+  function findPersonUpwards(startRow, col, tolCol, maxSteps){
+    let steps=0; for(let r=startRow-1; r>=0 && steps++<(maxSteps||40); r--){ const id=personOnLineNear(r,col,tolCol||12); if(id!=null) return id; }
+    return null;
+  }
+  function findPersonDownwards(startRow, col, tolCol, maxSteps){
+    let steps=0; for(let r=startRow+1; r<grid.length && steps++<(maxSteps||40); r++){ const id=personOnLineNear(r,col,tolCol||12); if(id!=null) return id; }
+    return null;
+  }
+  function rowSlashes(i){ const lefts=[]; const rights=[]; const pipes=[]; const row=grid[i]||[]; for(let c=0;c<row.length;c++){ const ch=row[c]; if(ch==='/' ) lefts.push(c); else if(ch==='\\') rights.push(c); else if(ch==='|') pipes.push(c); } return { lefts, rights, pipes }; }
+  function hasPipeWithinKBelow(i, col, K){ for(let k=1;k<=K && i+k<grid.length;k++){ const r=rowSlashes(i+k); for(const pc of r.pipes){ if(Math.abs(pc-col)<=1) return true; } // also consider being inside a junction segment
+    const rs=rowSlashes(i+k); for(const l of rs.lefts){ for(const rr of rs.rights){ if(l<rr && l<col && col<rr) return true; } } }
+    return false; }
+
+  const rawFamilies=[]; // {parents:[p1,p2?], children:[...]} before merge
+
+  // Pass 1: process junction rows that contain both / and \
+  for(let i=0;i<grid.length;i++){
+    const rs=rowSlashes(i); if(!rs.lefts.length || !rs.rights.length) continue;
+    // Greedy pairing
+    let rIdx=0;
+    for(const l of rs.lefts){ while(rIdx<rs.rights.length && rs.rights[rIdx]<=l) rIdx++; if(rIdx>=rs.rights.length) break; const r=rs.rights[rIdx++]; if(r-l>80) continue; const mid=Math.floor((l+r)/2);
+      // Parents above
+      const pLeft=findPersonUpwards(i,l,12,40);
+      const pRight=findPersonUpwards(i,r,12,40);
+      // Child below via midpoint and pipe continuity
+      const child=(hasPipeWithinKBelow(i,mid,6))?findPersonDownwards(i,mid,15,40):findPersonDownwards(i,mid,10,6);
+      logs.push({ type:'v4-junction', row:i, l, r, mid, pLeft, pRight, child });
+      const parents=[]; if(pLeft!=null) parents.push(pLeft); if(pRight!=null && pRight!==pLeft) parents.push(pRight);
+      if((parents.length||0) && child!=null){ rawFamilies.push({ parents: parents.slice(0,2), children:[child] }); }
+    }
+  }
+
+  // Pass 2: single slashes indicating direct parent-child edges
+  for(let i=0;i<grid.length;i++){
+    const rs=rowSlashes(i); const hasJunction=rs.lefts.length && rs.rights.length;
+    if(hasJunction) continue; // already handled by junction pass
+    // Process isolated '/'
+    for(const l of rs.lefts){
+      const parent=findPersonUpwards(i,l,12,40);
+      const child=findPersonDownwards(i,l-2,15,40) ?? findPersonDownwards(i,l,12,40);
+      if(parent!=null && child!=null){ rawFamilies.push({ parents:[parent], children:[child] }); logs.push({ type:'v4-single-slash', char:'/', row:i, col:l, parent, child }); }
+    }
+    // Process isolated '\\'
+    for(const r of rs.rights){
+      const parent=findPersonDownwards(i,r,12,40);
+      const child=findPersonUpwards(i,r-2,15,40) ?? findPersonUpwards(i,r,12,40);
+      if(parent!=null && child!=null){ rawFamilies.push({ parents:[parent], children:[child] }); logs.push({ type:'v4-single-slash', char:'\\', row:i, col:r, parent, child }); }
+    }
+  }
+
+  // Merge duplicate families by parent set and unique children
+  const merged=[]; const famMap=new Map();
+  for(const fam of rawFamilies){ const key=(fam.parents||[]).slice().sort((a,b)=>a-b).join('|'); if(!famMap.has(key)) famMap.set(key, { parents:(fam.parents||[]).slice(0,2), children: [] }); const dst=famMap.get(key); for(const c of fam.children||[]){ if(!dst.children.includes(c)) dst.children.push(c); } }
+  for(const v of famMap.values()) merged.push(v);
+
+  logs.push({ type:'v4-summary', people: people.length, families: merged.length });
+  return { people, families: merged, logs };
+}
+
 function buildGedcom(people, meta, families){
   const now=new Date(); const yyyy=now.getFullYear(); const mm=String(now.getMonth()+1).padStart(2,'0'); const dd=String(now.getDate()).padStart(2,'0');
   const head=[ '0 HEAD','1 SOUR GedMapper','2 NAME GedMapper GEDmatch Capture','2 VERS 0.1','1 DATE '+`${yyyy}-${mm}-${dd}`,'1 SUBM @SUB1@','1 GEDC','2 VERS 5.5.1','2 FORM LINEAGE-LINKED','1 CHAR UTF-8' ]; if(meta?.kit) head.push('1 _OM_REFERENCE_KIT '+meta.kit);
@@ -773,7 +1158,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
 
   document.getElementById('clearSession').onclick = async () => { if(!confirm('This will permanently clear the loaded CSV, parsed list, statuses, and pending data. Continue?')) return; await chrome.storage.local.remove(['gmGedmatchSession','gmGedmatchPendingMeta','gmPendingCsvText','gmStatusByKit','gmFocusedKit','gmCapturedByKit','gmLogsByKit']); document.getElementById('rows').innerHTML=''; document.getElementById('currentBox').classList.add('hidden'); updateStats([],'Cleared'); };
 
-  document.getElementById('btnCapture').onclick = async () => { const st=await getState(); const kit=st.focusedKit; if(!kit){ alert('No focused individual. Click Open on a row first.'); return;} try { const pre=await extractPreFromActiveTab(); const { people, families, logs }=parseIndividualsFromPreV3(pre); const profile=st.session.profiles.find(x=>x.Kit===kit); const gedcom=buildGedcom(people,{ kit }, families); await saveCapture(kit,{ gedcom, count: people.length, families: families.length, capturedAt:new Date().toISOString(), sourceUrl: profile?.treeUrl||'' }, logs); const statusByKit=st.statusByKit; statusByKit[kit]='yellow'; await saveStatusMap(statusByKit); setCurrentBox(profile,'yellow'); refreshStatusDots(st.session.profiles,statusByKit); updateStats(st.session.profiles, `Captured ${people.length} people, ${families.length} families`);} catch(e){ console.error('Capture failed',e); alert('Capture failed: '+(e?.message||e)); } };
+  document.getElementById('btnCapture').onclick = async () => { const st=await getState(); const kit=st.focusedKit; if(!kit){ alert('No focused individual. Click Open on a row first.'); return;} try { const pre=await extractPreFromActiveTab(); const rowsJson=buildIntermediaryRows(pre); const profile=st.session.profiles.find(x=>x.Kit===kit); await saveCapture(kit,{ rowsJson, capturedAt:new Date().toISOString(), sourceUrl: profile?.treeUrl||'' }, [{ type:'rows-summary', total: rowsJson.totalLines, personLines: rowsJson.personLines, charLines: rowsJson.charLines }]); const statusByKit=st.statusByKit; statusByKit[kit]='yellow'; await saveStatusMap(statusByKit); setCurrentBox(profile,'yellow'); refreshStatusDots(st.session.profiles,statusByKit); updateStats(st.session.profiles, `Rows JSON built: ${rowsJson.personLines} person rows, ${rowsJson.charLines} char rows`);} catch(e){ console.error('Capture failed',e); alert('Capture failed: '+(e?.message||e)); } };
 
   document.getElementById('btnFinalize').onclick = async () => { const st=await getState(); const kit=st.focusedKit; if(!kit) return; const statusByKit=st.statusByKit; statusByKit[kit]='green'; await saveStatusMap(statusByKit); const profile=st.session.profiles.find(x=>x.Kit===kit); setCurrentBox(profile,'green'); refreshStatusDots(st.session.profiles,statusByKit); };
 
@@ -782,6 +1167,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
   document.getElementById('btnCaptureSub').onclick = () => { alert('Capture Subtree: coming soon'); };
 
   document.getElementById('btnDownloadGedcom').onclick = async () => { const st=await getState(); const kit=st.focusedKit; if(!kit){ alert('No focused individual.'); return;} const cap=st.capturedByKit[kit]; if(!cap?.gedcom){ alert('No captured GEDCOM for this kit yet. Click Capture Tree first.'); return;} const blob=new Blob([cap.gedcom], { type:'text/plain' }); const url=URL.createObjectURL(blob); const filename=`gedmatch-capture-${kit}.ged`; await chrome.downloads.download({ url, filename, saveAs: true }); setTimeout(()=>URL.revokeObjectURL(url), 10000); };
+  document.getElementById('btnDownloadRowsJson').onclick = async () => { const st=await getState(); const kit=st.focusedKit; if(!kit){ alert('No focused individual.'); return;} const store=await chrome.storage.local.get(['gmCapturedByKit']); const cap=store.gmCapturedByKit?.[kit]; if(!cap?.rowsJson){ alert('No captured Rows JSON yet. Click Capture Tree first.'); return;} const blob=new Blob([JSON.stringify(cap.rowsJson, null, 2)], { type:'application/json' }); const url=URL.createObjectURL(blob); const filename=`gedmatch-rows-${kit}.json`; await chrome.downloads.download({ url, filename, saveAs:true }); setTimeout(()=>URL.revokeObjectURL(url), 10000); };
 
   document.getElementById('btnViewLog').onclick = async () => { const st=await getState(); const kit=st.focusedKit; if(!kit){ alert('No focused individual.'); return;} const logs=(await getState()).logsByKit?.[kit]; if(!logs || !logs.length){ alert('No logs captured yet. Click Capture Tree to generate logs.'); return;} const blob=new Blob([JSON.stringify(logs, null, 2)], { type:'application/json' }); const url=URL.createObjectURL(blob); const filename=`gedmatch-capture-log-${kit}.json`; await chrome.downloads.download({ url, filename, saveAs: true }); setTimeout(()=>URL.revokeObjectURL(url), 10000); };
 
@@ -790,4 +1176,21 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
   document.getElementById('exportJson').onclick = async () => { const s=(await getState()).session; const blob=new Blob([JSON.stringify(s.bundle||{}, null, 2)], { type:'application/json' }); const url=URL.createObjectURL(blob); const filename=`gedmatch-import-${new Date().toISOString().replace(/[:.]/g,'-')}.json`; await chrome.downloads.download({ url, filename, saveAs:true }); setTimeout(()=>URL.revokeObjectURL(url), 10000); };
 
   const st = await getState(); if (st.session.profiles?.length) { renderList(st.session.profiles, st.statusByKit); updateStats(st.session.profiles, st.pendingMeta?.name ? `Last: ${st.pendingMeta.name}` : undefined); if (st.focusedKit) { const p = st.session.profiles.find(x => x.Kit === st.focusedKit); if (p) setCurrentBox(p, st.statusByKit[p.Kit] || 'red'); } } else if (st.pendingMeta?.name) { updateStats([], `Pending: ${st.pendingMeta.name}`); } else { updateStats([]); }
+
+  // Parse ASCII from textarea using V6
+  document.getElementById('btnParseAscii').onclick = async () => {
+    const txt=(document.getElementById('asciiText').value||'').trim();
+    if(!txt){ alert('Paste the ASCII pedigree into the textbox first.'); return; }
+    try {
+      const pre={ ok:true, html: txt.replace(/\n/g,'<br>'), text: txt, anchors: [] };
+      const { people, families, logs }=parseIndividualsFromPreV7(pre);
+      const gedcom=buildGedcom(people, null, families);
+      const blob=new Blob([gedcom], { type:'text/plain' });
+      const url=URL.createObjectURL(blob);
+      await chrome.downloads.download({ url, filename:'gedmatch-ascii-parsed.ged', saveAs:true });
+      setTimeout(()=>URL.revokeObjectURL(url), 10000);
+      console.log('V6 ASCII parse:', { people:people.length, families:families.length, logs });
+      alert(`Parsed ASCII: ${people.length} people, ${families.length} families`);
+    } catch(e){ console.error('Parse ASCII failed', e); alert('Parse ASCII failed: '+(e?.message||e)); }
+  };
 })();
