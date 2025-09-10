@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "GedMapper GEDmatch Import",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Upload GEDmatch CSV, queue matches with GED links, and open their trees (Side Panel).",
   "action": {
     "default_title": "Open GEDmatch Importer"
@@ -9,14 +9,28 @@
   "side_panel": {
     "default_path": "sidepanel.html"
   },
-  "permissions": ["storage", "activeTab", "scripting", "downloads", "unlimitedStorage", "tabs", "sidePanel"],
-  "host_permissions": ["https://www.gedmatch.com/*"],
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting",
+    "downloads",
+    "unlimitedStorage",
+    "tabs",
+    "sidePanel"
+  ],
+  "host_permissions": [
+    "https://pro.gedmatch.com/*",
+    "https://*.gedmatch.com/*"
+  ],
   "background": {
     "service_worker": "background.js"
   },
   "content_scripts": [
     {
-      "matches": ["https://www.gedmatch.com/*"],
+      "matches": [
+        "https://pro.gedmatch.com/*",
+        "https://*.gedmatch.com/*"
+      ],
       "js": ["content.js"],
       "run_at": "document_idle"
     }

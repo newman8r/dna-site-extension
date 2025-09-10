@@ -13,15 +13,19 @@
       tr:nth-child(even) { background: #f6f6f6; }
       .btn { padding: 6px 10px; font-size: 12px; cursor: pointer; }
       .btn-primary { background: #1a73e8; color: #fff; border: none; }
+      .btn-danger { background: #e53935; color: #fff; border: none; }
       .btn-link { background: transparent; color: #1a73e8; border: none; padding: 0; }
       .muted { color: #666; font-size: 12px; }
       .list { max-height: 320px; overflow: auto; border: 1px solid #ddd; }
-      .controls { display: flex; gap: 8px; align-items: center; }
+      .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
       .pill { background: #eee; border-radius: 12px; padding: 2px 8px; font-size: 11px; }
       .dot { display:inline-block; width:10px; height:10px; border-radius:50%; box-shadow: 0 0 0 1px rgba(0,0,0,0.2) inset; }
       .dot.red { background:#e53935; }
       .dot.yellow { background:#f9a825; }
       .dot.green { background:#43a047; }
+      .current { border:1px solid #ddd; border-radius:6px; padding:8px; }
+      .current .header { display:flex; gap:8px; align-items:center; }
+      .hidden { display:none; }
     </style>
   </head>
   <body>
@@ -34,6 +38,28 @@
       <button id="parseBtn" class="btn btn-primary">Parse CSV</button>
       <span id="stats" class="pill">No file</span>
     </div>
+    <div class="row controls">
+      <button id="clearSession" class="btn btn-danger">Clear Session</button>
+      <span class="muted">Warning: this permanently clears the loaded CSV, list, statuses, and pending data.</span>
+    </div>
+
+    <div id="currentBox" class="row current hidden">
+      <div class="header">
+        <span id="currentDot" class="dot red"></span>
+        <strong id="currentName">—</strong>
+        <span id="currentKit" class="pill">—</span>
+      </div>
+      <div class="muted" id="currentEmail"></div>
+      <div class="controls" style="margin-top:6px;">
+        <button id="btnCapture" class="btn btn-primary">Capture Tree</button>
+        <button id="btnCaptureSub" class="btn">Capture Subtree</button>
+        <button id="btnFinalize" class="btn">Finalize</button>
+        <button id="btnClearCopy" class="btn btn-danger">Clear Captured</button>
+        <button id="btnDownloadGedcom" class="btn">Download GEDCOM</button>
+        <button id="btnViewLog" class="btn">View Parser Log</button>
+      </div>
+    </div>
+
     <div class="row">
       <div class="muted">Rows with GED links</div>
       <div class="list">
