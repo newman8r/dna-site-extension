@@ -131,8 +131,16 @@ function parsePersonLabel(label){ let name=label.trim(); let birthStr=null, deat
 
 async function extractPreFromActiveTab(){
   const [tab]=await chrome.tabs.query({active:true,currentWindow:true}); if(!tab?.id) throw new Error('No active tab');
-  const [{result}={}] = await chrome.scripting.executeScript({ target:{tabId:tab.id}, func:()=>{ const pre=document.querySelector('section.response-items pre')||document.querySelector('pre'); if(!pre) return {ok:false,error:'pre not found'}; const rect=pre.getBoundingClientRect(); const anchors=Array.from(pre.querySelectorAll('a')).map(a=>{ const r=a.getBoundingClientRect(); const font=a.querySelector('font'); const color=(font?.getAttribute('color')||'').toLowerCase(); return { label:(a.textContent||'').trim(), href:a.getAttribute('href')||a.href||'', color, x: Math.round(r.left-rect.left), y: Math.round(r.top-rect.top) }; }); return {ok:true, html: pre.innerHTML, text: pre.innerText, anchors}; }});
-  if(!result?.ok) throw new Error(result?.error||'extract failed'); return result; }
+  const frames = await chrome.scripting.executeScript({ target:{tabId:tab.id, allFrames:true}, func:()=>{ function collectFrom(root){ const rect=root.getBoundingClientRect(); const anchors=Array.from(root.querySelectorAll('a')).map(a=>{ const r=a.getBoundingClientRect(); const font=a.querySelector('font'); const color=(font?.getAttribute('color')||'').toLowerCase(); return { label:(a.textContent||'').trim(), href:a.getAttribute('href')||a.href||'', color, x: Math.round(r.left-rect.left), y: Math.round(r.top-rect.top) }; }); return { html: root.innerHTML, text: root.innerText, anchors }; }
+    const pre=document.querySelector('section.response-items pre')||document.querySelector('pre');
+    if(pre){ const data=collectFrom(pre); return { ok:true, ...data, frame: window.location.href } }
+    const container=document.querySelector('section.response-items')||document.querySelector('.response-items')||document.body;
+    if(container){ const data=collectFrom(container); return { ok:true, ...data, note:'fallback-no-pre', frame: window.location.href } }
+    return { ok:false, error:'pre not found' };
+  }});
+  const ok=frames.find(f=>f?.result?.ok);
+  if(!ok?.result?.ok) throw new Error(ok?.result?.error||'pre not found');
+  return ok.result; }
 
 function clusterRows(anchors){ const sorted=[...anchors].sort((a,b)=>a.y-b.y); const rows=[]; const ys=[]; for(const a of sorted){ if(!ys.length || Math.abs(a.y-ys[ys.length-1])>14){ ys.push(a.y); rows.push([a]); } else { rows[rows.length-1].push(a); } } return rows; }
 
@@ -390,27 +398,419 @@ function buildIntermediaryRows(result){
   const text=(result.text||'').replace(/\u00a0/g,' ');
   const lines=text.split(/\r?\n/);
   let anchors=[];
-  if(Array.isArray(result.anchors)&&result.anchors.length){ anchors=result.anchors.map(a=>({ label:(a.label||'').trim(), href:a.href||'', color:(a.color||'').toLowerCase() })); }
-  else { const container=document.createElement('div'); container.innerHTML=result.html||''; anchors=Array.from(container.querySelectorAll('a')).map(a=>{ const font=a.querySelector('font'); return { label:(a.textContent||'').trim(), href:a.getAttribute('href')||'', color:(font?.getAttribute('color')||'').toLowerCase() }; }); }
+  if(Array.isArray(result.anchors)&&result.anchors.length){ anchors=result.anchors.map(a=>({ label:(a.label||'').trim(), href:a.href||'', color:(a.color||'').toLowerCase(), x: typeof a.x==='number'?a.x:null, y: typeof a.y==='number'?a.y:null })); }
+  else { const container=document.createElement('div'); container.innerHTML=result.html||''; anchors=Array.from(container.querySelectorAll('a')).map(a=>{ const font=a.querySelector('font'); return { label:(a.textContent||'').trim(), href:a.getAttribute('href')||'', color:(font?.getAttribute('color')||'').toLowerCase(), x:null, y:null }; }); }
 
   function pairOutermost(lefts, rights){ const segs=[]; let li=0; let ri=rights.length-1; while(li<lefts.length && ri>=0){ const l=lefts[li]; while(ri>=0 && rights[ri]<=l) ri--; if(ri<0) break; const r=rights[ri--]; if(r>l) segs.push({ L:l, R:r, mid: Math.floor((l+r)/2) }); li++; } return segs; }
 
-  const rows=[]; let personLines=0; let charLines=0;
+  const rows=[]; let personLines=0; let charLines=0; const personRefs=[]; // collect to quantize indents later
+  const usedAnchor=new Array(anchors.length).fill(false);
   for(let i=0;i<lines.length;i++){
     const s=lines[i];
+    // skip whitespace-only rows entirely
+    if(!s || s.trim().length===0) continue;
     // pipe scan for every row (both person and char rows can have pipes)
     const rowPipes=[]; for(let c=0;c<s.length;c++){ if(s[c]==='|') rowPipes.push(c); }
     // detect persons from anchors on this line
-    const persons=[]; for(const a of anchors){ if(!a.label) continue; const idx=s.indexOf(a.label); if(idx!==-1){ const parsed=parsePersonLabel(a.label); const sex=a.color==='red'?'F':a.color==='blue'?'M':'U'; const url=resolveGedUrl(a.href||''); const leadingSpaces=(s.match(/^\s*/)||[''])[0].length; const indent=Math.floor(leadingSpaces/2); persons.push({ label:a.label, name:parsed.name, birth:parsed.birth, death:parsed.death, sex, url, col:idx, indent, leadingSpaces }); } }
+    const persons=[]; {
+      const matchIdxs=[];
+      for(let ai=0; ai<anchors.length; ai++){
+        const a=anchors[ai]; if(!a.label) continue; if(s.indexOf(a.label)!==-1) matchIdxs.push(ai);
+      }
+      // pick the first unused matching anchor (there should be exactly one person per line)
+      const chosenIdx=matchIdxs.find(ai=>!usedAnchor[ai]);
+      if(chosenIdx!=null){
+        const a=anchors[chosenIdx]; usedAnchor[chosenIdx]=true;
+        const idx=s.indexOf(a.label);
+        const parsed=parsePersonLabel(a.label);
+        const sex=a.color==='red'?'F':a.color==='blue'?'M':'U';
+        const url=resolveGedUrl(a.href||'');
+        const indentRaw=idx; const px=a.x;
+        const rec={ label:a.label, name:parsed.name, birth:parsed.birth, death:parsed.death, sex, url, col:idx, indentRaw, px, indent:null, leadingSpaces:(s.match(/^\s*/)||[''])[0].length };
+        persons.push(rec); personRefs.push({ line:i, ref:rec });
+      }
+    }
     if(persons.length){
       rows.push({ idx:i, type:'person', persons, text:s, pipes: rowPipes, pipeCount: rowPipes.length }); personLines++; continue;
     }
     // char row tokens
     const pipes=[]; const lefts=[]; const rights=[]; for(let c=0;c<s.length;c++){ const ch=s[c]; if(ch==='|') pipes.push(c); else if(ch==='/') lefts.push(c); else if(ch==='\\') rights.push(c); }
     const segments=pairOutermost(lefts, rights);
-    rows.push({ idx:i, type:'char', pipes, pipeCount: pipes.length, lefts, rights, segments, text:s }); charLines++;
+    if(pipes.length || lefts.length || rights.length){ rows.push({ idx:i, type:'char', pipes, pipeCount: pipes.length, lefts, rights, segments, text:s }); charLines++; }
   }
-  return { totalLines: lines.length, personLines, charLines, rows };
+  // Quantize person indents to discrete levels using label column (fallback to pixel x if helpful)
+  const cols=personRefs.map(r=>r.ref.col).sort((a,b)=>a-b);
+  const uniqueCols=[...new Set(cols)];
+  let minCol=uniqueCols.length?uniqueCols[0]:0;
+  let step=0;
+  for(let i=1;i<uniqueCols.length;i++){ const d=uniqueCols[i]-uniqueCols[i-1]; if(d>0 && (step===0 || d<step)) step=d; }
+  if(!step || step<2){ step=4; }
+  for(const pr of personRefs){ pr.ref.indent=Math.max(0, Math.round((pr.ref.col - minCol)/step)); }
+  return { totalLines: lines.length, personLines, charLines, indentBase:minCol, indentStep:step, rows };
+}
+
+// V9: Strict, position-based graph -> families using revised GROK rules
+function buildFamiliesFromRowsV9(rowsJson){
+  const logs=[];
+  const rows=rowsJson?.rows||[];
+  const indentStep = Number(rowsJson?.indentStep ?? 6);
+  const OFFSET = Math.max(1, Math.floor(indentStep/2));
+  const TOL = 3;
+
+  // Build people list and row mappings
+  const people=[]; const rowToId=new Map(); const idxToRowIndex=new Map();
+  for(let i=0;i<rows.length;i++){ idxToRowIndex.set(rows[i].idx, i); }
+  for(const r of rows){
+    if(r.type==='person' && Array.isArray(r.persons) && r.persons.length){
+      const pr=r.persons[0];
+      const id=people.length;
+      people.push({ id, name:(pr.name||'').trim(), originalName:(pr.name||'').trim(), sex:(pr.sex||'U').toUpperCase(), birth:pr.birth||null, death:pr.death||null, url:pr.url||'', indent:Number(pr.indent||0), col:Number(pr.col||0), label:(pr.label||'').trim(), line:r.idx, parents:[], children:[], spouse:null });
+      rowToId.set(r.idx, id);
+    }
+  }
+
+  // Helpers to find nearest person row above/below given array index
+  function personIdAbove(arrayIdx){ for(let k=arrayIdx-1;k>=0;k--){ const rr=rows[k]; if(rr.type==='person' && rowToId.has(rr.idx)) return rowToId.get(rr.idx); } return null; }
+  function personIdBelow(arrayIdx){ for(let k=arrayIdx+1;k<rows.length;k++){ const rr=rows[k]; if(rr.type==='person' && rowToId.has(rr.idx)) return rowToId.get(rr.idx); } return null; }
+  function addEdge(childId,parentId){ if(childId==null||parentId==null) return; if(!people[childId].parents.includes(parentId)) people[childId].parents.push(parentId); if(!people[parentId].children.includes(childId)) people[parentId].children.push(childId); }
+  function matchAt(pid, col){ if(pid==null) return false; return Math.abs((people[pid].col||0) - col) <= TOL; }
+
+  // Trace continuity along a column until next person row appears
+  function traceDownFromChar(charArrIdx, startCol){
+    let col=startCol; let window=null; // [L,R] when inside a segment span
+    for(let k=charArrIdx+1; k<rows.length; k++){
+      const rr=rows[k];
+      if(rr.type==='char'){
+        // If inside a segment, keep window and allow span; else require pipe continuity
+        const seg=(rr.segments||[]).find(s=> s.L<=col && col<=s.R);
+        if(seg){ window=[seg.L, seg.R]; continue; }
+        // Diagonal shift across nearby slashes
+        let shifted=false; if((rr.rights||[]).some(rp=>Math.abs(rp-col)<=3)){ const R=(rr.rights||[]).reduce((b,v)=> Math.abs(v-col)<Math.abs(b-col)?v:b, rr.rights[0]); const mid=Math.floor((col+R)/2); col = mid + OFFSET; shifted=true; }
+        if((rr.lefts||[]).some(lp=>Math.abs(lp-col)<=3)){ const L=(rr.lefts||[]).reduce((b,v)=> Math.abs(v-col)<Math.abs(b-col)?v:b, rr.lefts[0]); const mid=Math.floor((col+L)/2); col = mid - OFFSET; shifted=true; }
+        if(shifted) { window=null; continue; }
+        const hasPipe=(rr.pipes||[]).some(p=>Math.abs(p-col)<=3);
+        if(hasPipe) continue;
+        // if we had a window previously but no new coverage, keep pipe requirement
+        return null;
+      } else if(rr.type==='person'){
+        const pid=rowToId.get(rr.idx);
+        if(window){ const pc=people[pid].col||0; if(pc>=window[0]-TOL && pc<=window[1]+TOL) return pid; }
+        if(matchAt(pid,col)) return pid;
+        // pass-through if person row has a nearby pipe, or if the next char row below spans this col
+        const personPipes=(rr.pipes||[]); if(personPipes.some(p=>Math.abs(p-col)<=3)) continue;
+        const next=rows[k+1]; if(next && next.type==='char'){ const seg2=(next.segments||[]).find(s=> s.L<=col && col<=s.R); if(seg2){ window=[seg2.L, seg2.R]; k++; continue; } }
+        return null;
+      }
+    }
+    return null;
+  }
+  function traceUpFromChar(charArrIdx, startCol){
+    let col=startCol; let window=null;
+    for(let k=charArrIdx-1; k>=0; k--){
+      const rr=rows[k];
+      if(rr.type==='char'){
+        const seg=(rr.segments||[]).find(s=> s.L<=col && col<=s.R);
+        if(seg){ window=[seg.L, seg.R]; continue; }
+        // Diagonal shift across nearby slashes
+        let shifted=false; if((rr.rights||[]).some(rp=>Math.abs(rp-col)<=3)){ const R=(rr.rights||[]).reduce((b,v)=> Math.abs(v-col)<Math.abs(b-col)?v:b, rr.rights[0]); const mid=Math.floor((col+R)/2); col = mid - OFFSET; shifted=true; }
+        if((rr.lefts||[]).some(lp=>Math.abs(lp-col)<=3)){ const L=(rr.lefts||[]).reduce((b,v)=> Math.abs(v-col)<Math.abs(b-col)?v:b, rr.lefts[0]); const mid=Math.floor((col+L)/2); col = mid + OFFSET; shifted=true; }
+        if(shifted) { window=null; continue; }
+        const hasPipe=(rr.pipes||[]).some(p=>Math.abs(p-col)<=3);
+        if(hasPipe) continue;
+        return null;
+      } else if(rr.type==='person'){
+        const pid=rowToId.get(rr.idx);
+        if(window){ const pc=people[pid].col||0; if(pc>=window[0]-TOL && pc<=window[1]+TOL) return pid; }
+        if(matchAt(pid,col)) return pid;
+        const personPipes=(rr.pipes||[]); if(personPipes.some(p=>Math.abs(p-col)<=3)) continue; // pass-through person with pipe
+        const prev=rows[k-1]; if(prev && prev.type==='char'){ const seg2=(prev.segments||[]).find(s=> s.L<=col && col<=s.R); if(seg2){ window=[seg2.L, seg2.R]; k--; continue; } }
+        return null;
+      }
+    }
+    return null;
+  }
+
+  // Process connector rows bottom-up (with deep pipe bridging)
+  for(let i=0;i<rows.length;i++){
+    const r=rows[i]; if(r.type!=='char') continue; const txt=r.text||'';
+    const upId=personIdAbove(i); const dnId=personIdBelow(i);
+    // Segments (paired / and \)
+    if((Array.isArray(r.segments) && r.segments.length) || ((r.lefts?.length||0) && (r.rights?.length||0))){
+      const segPairs=[]; const seen=new Set();
+      const addPair=(L,R,ch)=>{ const key=L+":"+R+":"+ch; if(seen.has(key)) return; seen.add(key); segPairs.push({ L:Number(L), R:Number(R), mid:Math.floor((Number(L)+Number(R))/2), ch }); };
+      if(Array.isArray(r.segments) && r.segments.length){
+        for(const seg of r.segments){ const L=Number(seg.L), R=Number(seg.R); const ch=txt.charAt(L)||'/'; const key=L+":"+R+":"+ch; if(!seen.has(key)) { seen.add(key); segPairs.push({ L, R, mid:Number(seg.mid), ch }); } }
+      }
+      // Build pairs even when one side precedes the other
+      const lefts=(r.lefts||[]).map(Number); const rights=(r.rights||[]).map(Number);
+      // Standard: for each '/' at L, pair with nearest '\\' to the right
+      for(const L of lefts){ let bestR=null, best=1e9; for(const R of rights){ if(R>L && (R-L)<best){ best=R-L; bestR=R; } } if(bestR!=null) addPair(L,bestR,'/'); }
+      // Reversed: for each '\\' at R (in rights array), pair with nearest '/' to the right
+      for(const R of rights){ let bestL=null, best=1e9; for(const L of lefts){ if(L>R && (L-R)<best){ best=L-R; bestL=L; } } if(bestL!=null) addPair(bestL,R,'\\'); }
+      for(const pair of segPairs){
+        const parentCol=pair.mid + OFFSET; const childCol=pair.mid - OFFSET;
+        // Try up-orientation first (parents above, child below)
+        let upParent=traceUpFromChar(i,parentCol); let downChild=traceDownFromChar(i,childCol);
+        let added=false;
+        if(upParent!=null && downChild!=null){ addEdge(downChild, upParent); added=true; }
+        if(!added){
+          // Try down-orientation (parent below, child above)
+          const downParent=traceDownFromChar(i,parentCol); const upChild=traceUpFromChar(i,childCol);
+          if(downParent!=null && upChild!=null){ addEdge(upChild, downParent); added=true; }
+        }
+      }
+    }
+    // Single slashes
+    else {
+      if((r.lefts||[]).length && !(r.rights||[]).length){
+        for(const L of r.lefts){ const parent=traceUpFromChar(i, Number(L)+OFFSET); const child=traceDownFromChar(i, Number(L)-OFFSET); if(parent!=null && child!=null) addEdge(child,parent); }
+      }
+      if((r.rights||[]).length && !(r.lefts||[]).length){
+        for(const R of r.rights){ const parent=traceDownFromChar(i, Number(R)+OFFSET); const child=traceUpFromChar(i, Number(R)-OFFSET); if(parent!=null && child!=null) addEdge(child,parent); }
+      }
+    }
+    // Pipes: connect across very long stacks by following the lane up to first person and down to last person
+    for(const P of (r.pipes||[])){
+      // Extend upwards until a person or break
+      let upChar=i; let topPerson=null; let guard=0;
+      while(upChar>=0 && guard++<100){ const res=traceUpFromChar(upChar, P); const prevChar=upChar-1; if(res!=null){ topPerson=res; break; } if(prevChar<0 || rows[prevChar].type!=='char') break; const hasPipe=(rows[prevChar].pipes||[]).some(pp=>Math.abs(pp-P)<=3); const seg=(rows[prevChar].segments||[]).some(s=>s.L<=P && P<=s.R); if(!(hasPipe||seg)) break; upChar=prevChar; }
+      // Extend downwards until a person or break
+      let downChar=i; let bottomPerson=null; guard=0;
+      while(downChar<rows.length && guard++<100){ const res=traceDownFromChar(downChar, P); const nextChar=downChar+1; if(res!=null){ bottomPerson=res; break; } if(nextChar>=rows.length || rows[nextChar].type!=='char') break; const hasPipe=(rows[nextChar].pipes||[]).some(pp=>Math.abs(pp-P)<=3); const seg=(rows[nextChar].segments||[]).some(s=>s.L<=P && P<=s.R); if(!(hasPipe||seg)) break; downChar=nextChar; }
+      if(topPerson!=null && bottomPerson!=null){ if(people[topPerson].indent>people[bottomPerson].indent) addEdge(bottomPerson, topPerson); else addEdge(topPerson, bottomPerson); }
+    }
+  }
+
+  // Spouse inference: same indent, close columns, prefer differing sex
+  const spouseOf=new Map();
+  const levelSorted=people.slice().sort((a,b)=> b.indent-a.indent || a.col-b.col);
+  for(let i=0;i<levelSorted.length-1;i++){
+    const a=levelSorted[i], b=levelSorted[i+1];
+    if(a.indent===b.indent && Math.abs(a.col-b.col) <= Math.floor(indentStep*1.5) && !spouseOf.has(a.id) && !spouseOf.has(b.id)){
+      // Optional: require shared child to reduce false positives
+      const kidsA=new Set(a.children), kidsB=new Set(b.children); let shared=false; for(const c of kidsA){ if(kidsB.has(c)){ shared=true; break; } }
+      if(shared || a.sex!==b.sex || a.sex==='U' || b.sex==='U'){ spouseOf.set(a.id,b.id); spouseOf.set(b.id,a.id); }
+    }
+  }
+
+  // Families from spouses and single parents
+  const families=[]; const famKeySet=new Set();
+  function pushFamily(parents, childList){ const key=parents.slice().sort((x,y)=>x-y).join('|'); let fam; if(!famKeySet.has(key)){ famKeySet.add(key); fam={ parents: parents.slice(0,2), children: [] }; families.push(fam); } else { fam=families.find(f=>f.parents.slice().sort((x,y)=>x-y).join('|')===key); }
+    for(const c of childList){ if(!fam.children.includes(c)) fam.children.push(c); } }
+
+  // Add spouse families
+  for(const p of people){ const s=spouseOf.get(p.id); if(s!=null && p.id<s){ const kids=new Set([...(people[p.id].children||[]), ...(people[s].children||[])]); pushFamily([p.id,s], Array.from(kids)); } }
+  // Add single-parent families
+  for(const p of people){ if(!spouseOf.has(p.id) && (p.children||[]).length){ pushFamily([p.id], p.children||[]); } }
+
+  logs.push({ type:'v9-summary', people: people.length, families: families.length });
+  return { people, families, logs };
+}
+
+// V8: From-scratch builder using clean rows JSON (segments, slashes, pipes)
+function buildFamiliesFromRowsV8(rowsJson){
+  const logs=[];
+  const rows=rowsJson?.rows||[];
+  const people=[]; const rowToPid=new Map(); const personRows=[]; const charRows=[];
+  for(const r of rows){
+    if(r.type==='person' && Array.isArray(r.persons) && r.persons.length){
+      const pr=r.persons[0]; const id=people.length;
+      people.push({ id, name: pr.name||'Unknown', sex: pr.sex||'U', birth: pr.birth||null, death: pr.death||null, url: pr.url||'', indent: pr.indent??0, col: pr.col||0, label: pr.label||'', line: r.idx });
+      rowToPid.set(r.idx, id); personRows.push(r);
+    } else if(r.type==='char') { charRows.push(r); }
+  }
+
+  // helpers
+  const tolCol=28;
+  function nearPid(pid, col){ if(pid==null) return false; const pc=people[pid].col||0; return Math.abs(pc-col)<=tolCol; }
+  function width(pid){ const lbl=people[pid].label||''; return Math.max(10, Math.min(60, lbl.length)); }
+  function addEdge(childId, parentId){ if(childId==null||parentId==null) return; edgesChildToParents.get(childId)?.add(parentId) || edgesChildToParents.set(childId, new Set([parentId])); childrenOf.get(parentId)?.add(childId) || childrenOf.set(parentId, new Set([childId])); }
+
+  const edgesChildToParents=new Map(); // childId -> Set(parentId)
+  const childrenOf=new Map(); // parentId -> Set(childId)
+
+  // Trace pipes: connect above to below when aligned
+  for(const r of charRows){ const above=rowToPid.get(r.idx-1); const below=rowToPid.get(r.idx+1); if(above!=null && below!=null){ for(const p of (r.pipes||[])){ if(nearPid(above,p) && nearPid(below,p)) addEdge(below, above); } } }
+
+  // Handle segments and single slashes
+  for(const r of charRows){ const above=rowToPid.get(r.idx-1); const below=rowToPid.get(r.idx+1); const txt=r.text||'';
+    if((r.segments||[]).length){
+      for(let si=0; si<r.segments.length; si++){
+        const seg=r.segments[si]; const L=seg.L, R=seg.R, mid=seg.mid;
+        const slashChar=txt[L]||'/';
+        if(slashChar==='/'){
+          const parent= (above!=null && (nearPid(above,R) || (Math.abs((people[above].col||0)-(R))<=width(above)))) ? above : null;
+          const child= (below!=null && nearPid(below,L)) ? below : null;
+          if(parent!=null && child!=null) addEdge(child,parent);
+        } else if(slashChar==='\\'){
+          const parent= (below!=null && (nearPid(below,R) || (Math.abs((people[below].col||0)-R)<=width(below)))) ? below : null;
+          const child= (above!=null && nearPid(above,L)) ? above : null;
+          if(parent!=null && child!=null) addEdge(child,parent);
+        }
+      }
+    } else {
+      // single slash rows
+      if((r.lefts||[]).length && !(r.rights||[]).length){
+        for(const L of r.lefts){ const ch=txt[L]; if(ch!=='/') continue; const parent=above!=null?above:null; const child=below!=null?below:null; if(parent!=null && child!=null && (nearPid(parent,L+2) || nearPid(parent,L)) && nearPid(child,L-2)) addEdge(child,parent); }
+      }
+      if((r.rights||[]).length && !(r.lefts||[]).length){
+        for(const R of r.rights){ const ch='\\'; const parent=below!=null?below:null; const child=above!=null?above:null; if(parent!=null && child!=null && (nearPid(parent,R+2) || nearPid(parent,R)) && nearPid(child,R-2)) addEdge(child,parent); }
+      }
+    }
+  }
+
+  // Build spouse inference (same indent, close cols or shared child)
+  const spouseOf=new Map();
+  const sorted=people.slice().sort((a,b)=> a.indent!==b.indent ? b.indent-a.indent : a.col-b.col);
+  for(let i=0;i<sorted.length-1;i++){
+    const a=sorted[i], b=sorted[i+1];
+    if(a.indent===b.indent && Math.abs(a.col-b.col)<60 && !spouseOf.has(a.id) && !spouseOf.has(b.id)){
+      // prefer differing sex if available
+      if(a.sex!==b.sex || a.sex==='U' || b.sex==='U'){ spouseOf.set(a.id,b.id); spouseOf.set(b.id,a.id); }
+    }
+  }
+
+  // Build families from edges and spouses
+  const families=[]; const famKeySet=new Set();
+  function pushFamily(parents, children){ const key=parents.slice().sort((x,y)=>x-y).join('|'); if(!famKeySet.has(key)){ famKeySet.add(key); families.push({ parents: parents.slice(0,2), children: Array.from(children||[]) }); } else { const fam=families.find(f=>f.parents.slice().sort((x,y)=>x-y).join('|')===key); for(const c of (children||[])) if(!fam.children.includes(c)) fam.children.push(c); }
+  }
+
+  // spouse-based grouping with children union
+  for(const p of people){ const s=spouseOf.get(p.id); if(s!=null && p.id<s){ const kids=new Set([...(childrenOf.get(p.id)||[]), ...(childrenOf.get(s)||[])]); pushFamily([p.id,s], kids); } }
+  // single-parent families
+  for(const [parentId,kids] of childrenOf.entries()){ if(!spouseOf.has(parentId)) pushFamily([parentId], kids); }
+
+  logs.push({ type:'v8-summary', people: people.length, families: families.length });
+  return { people, families, logs };
+}
+
+// Construct people and families from intermediary rows JSON - fixed algorithm
+function buildFamiliesFromRows(rowsJson){
+  const logs=[];
+  const rows=rowsJson?.rows||[];
+  
+  // Build people array and row->person map
+  const people=[]; const rowToPid=new Map(); const personRows=[];
+  rows.forEach(r=>{ if(r.type==='person' && Array.isArray(r.persons) && r.persons.length){ const p=r.persons[0]; const id=people.length; people.push({ id, sex:p.sex||'U', url:p.url||'', name:p.name||'Unknown', birth:p.birth||null, death:p.death||null, line:r.idx, col: p.col||0, indent: typeof p.indent==='number'?p.indent:0 }); rowToPid.set(r.idx, id); personRows.push(r); }});
+
+  // Helper to find person at specific row
+  function personAtRow(rowIdx){ return rowToPid.get(rowIdx) ?? null; }
+  
+  // Helper to find nearest person above/below by column
+  const tolCol=30;
+  function nearestPersonAbove(rowIdx, col){ let best=null, bestd=1e9; for(const r of personRows){ if(r.idx>=rowIdx) continue; const pid=rowToPid.get(r.idx); const pcol=(r.persons[0]||{}).col||0; const d=Math.abs(pcol-col); if(d<bestd){ best=pid; bestd=d; } } return (bestd<=tolCol)?best:null; }
+  function nearestPersonBelow(rowIdx, col){ let best=null, bestd=1e9; for(const r of personRows){ if(r.idx<=rowIdx) continue; const pid=rowToPid.get(r.idx); const pcol=(r.persons[0]||{}).col||0; const d=Math.abs(pcol-col); if(d<bestd){ best=pid; bestd=d; } } return (bestd<=tolCol)?best:null; }
+
+  // Build families using pipe-enforced approach
+  const families=[];
+  const famKey=(p1,p2)=>{ const ps=[p1,p2].filter(x=>x!=null).sort((a,b)=>a-b); return ps.join('|'); };
+  const famMap=new Map();
+  
+  // Precompute active pipe columns per char row (state machine)
+  const charRows=rows.filter(r=>r.type==='char');
+  const charIdxToActive=new Map();
+  for(let k=0;k<charRows.length;k++){
+    const r=charRows[k]; const prev=charRows[k-1];
+    const active=new Set();
+    // carry pipes
+    for(const c of (r.pipes||[])) active.add(c);
+    // carry over from prev via continuity
+    if(prev){
+      const prevActive=charIdxToActive.get(prev.idx)||new Set();
+      for(const c of prevActive){
+        // keep if a pipe at same col, or if inside any L/R segment on this row
+        const hasPipe=(r.pipes||[]).some(x=>Math.abs(x-c)<=0);
+        const covered=(r.segments||[]).some(seg=>seg.L<c && c<seg.R);
+        if(hasPipe || covered) active.add(c);
+      }
+    }
+    charIdxToActive.set(r.idx, active);
+  }
+
+  // Process each char row with pipe validation
+  for(let i=0; i<rows.length; i++){
+    const r=rows[i];
+    if(r.type!=='char') continue;
+    const active=charIdxToActive.get(r.idx)||new Set();
+    
+    // If child immediately above
+    if(i>0 && rows[i-1].type==='person'){
+      const childId=personAtRow(rows[i-1].idx); const child=people[childId];
+      let leftParent=null, rightParent=null;
+      if((r.lefts||[]).length){ leftParent=nearestPersonAbove(i, r.lefts[0]); }
+      if((r.rights||[]).length){ rightParent=nearestPersonBelow(i, r.rights[(r.rights.length-1)]); }
+      const parents=[leftParent, rightParent].filter(x=>x!=null);
+      if(parents.length){ const key=famKey(parents[0], parents[1]); if(!famMap.has(key)){ famMap.set(key,{ parents:parents.slice(0,2), children:[] }); families.push(famMap.get(key)); } const fam=famMap.get(key); if(!fam.children.includes(childId)) fam.children.push(childId); logs.push({ type:'child-above-row', row:i, child:childId, parents }); }
+      continue;
+    }
+
+    // Check for segments (marriage junctions)
+    if(r.segments && r.segments.length){
+      for(const seg of r.segments){
+        // require a child reachable via the midpoint pipe
+        const child=findChildViaPipe(i, seg.mid);
+        if(child==null){ logs.push({ type:'skip-seg-no-child', row:i, seg }); continue; }
+        // Check if there's a person immediately above (parent1)
+        const abovePerson = (i>0 && rows[i-1].type==='person') ? personAtRow(rows[i-1].idx) : null;
+        // Check if there's a person immediately below (child or parent2)
+        const belowPerson = (i<rows.length-1 && rows[i+1].type==='person') ? personAtRow(rows[i+1].idx) : null;
+        
+        if(abovePerson!=null && belowPerson!=null){
+          // This is likely parent-spouse junction
+          const leftParent = abovePerson;
+          const rightParent = belowPerson;
+          if(child!=null && child!==belowPerson){
+            const key=famKey(leftParent,rightParent);
+            if(!famMap.has(key)){ famMap.set(key,{ parents:[leftParent,rightParent], children:[] }); families.push(famMap.get(key)); }
+            const fam=famMap.get(key);
+            if(!fam.children.includes(child)) fam.children.push(child);
+            logs.push({ type:'marriage-junction', row:i, leftParent, rightParent, child });
+          }
+        } else {
+          // Standard junction: parents above, child below
+          const pL = nearestPersonAbove(i, seg.L);
+          const pR = nearestPersonAbove(i, seg.R);
+          if(child!=null && (pL!=null || pR!=null)){
+            const key=famKey(pL,pR);
+            if(!famMap.has(key)){ famMap.set(key,{ parents:[pL,pR].filter(x=>x!=null), children:[] }); families.push(famMap.get(key)); }
+            const fam=famMap.get(key);
+            if(!fam.children.includes(child)) fam.children.push(child);
+            logs.push({ type:'standard-junction', row:i, parents:[pL,pR].filter(x=>x!=null), child });
+          }
+        }
+      }
+    }
+    // Single slash cases
+    else if((r.lefts||[]).length && !(r.rights||[]).length){
+      for(const c of r.lefts){
+        const child=nearestPersonBelow(i,c);
+        const parent=nearestPersonAbove(i,c);
+        if(parent!=null && child!=null){
+          const key=famKey(parent,null);
+          if(!famMap.has(key)){ famMap.set(key,{ parents:[parent], children:[] }); families.push(famMap.get(key)); }
+          const fam=famMap.get(key);
+          if(!fam.children.includes(child)) fam.children.push(child);
+          logs.push({ type:'single-left', row:i, parent, child });
+        }
+      }
+    }
+    else if((r.rights||[]).length && !(r.lefts||[]).length){
+      for(const c of r.rights){
+        const child=(i>0 && rows[i-1].type==='person')? personAtRow(rows[i-1].idx) : nearestPersonAbove(i,c);
+        const parent=nearestPersonBelow(i,c);
+        if(parent!=null && child!=null){
+          const key=famKey(parent,null);
+          if(!famMap.has(key)){ famMap.set(key,{ parents:[parent], children:[] }); families.push(famMap.get(key)); }
+          const fam=famMap.get(key);
+          if(!fam.children.includes(child)) fam.children.push(child);
+          logs.push({ type:'single-right', row:i, parent, child });
+        }
+      }
+    }
+  }
+  
+  logs.push({ type:'summary', people: people.length, families: families.length });
+  return { people, families, logs };
 }
 
 // Pipe-reduction algorithm - processes from most pipes to least
@@ -1158,7 +1558,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
 
   document.getElementById('clearSession').onclick = async () => { if(!confirm('This will permanently clear the loaded CSV, parsed list, statuses, and pending data. Continue?')) return; await chrome.storage.local.remove(['gmGedmatchSession','gmGedmatchPendingMeta','gmPendingCsvText','gmStatusByKit','gmFocusedKit','gmCapturedByKit','gmLogsByKit']); document.getElementById('rows').innerHTML=''; document.getElementById('currentBox').classList.add('hidden'); updateStats([],'Cleared'); };
 
-  document.getElementById('btnCapture').onclick = async () => { const st=await getState(); const kit=st.focusedKit; if(!kit){ alert('No focused individual. Click Open on a row first.'); return;} try { const pre=await extractPreFromActiveTab(); const rowsJson=buildIntermediaryRows(pre); const profile=st.session.profiles.find(x=>x.Kit===kit); await saveCapture(kit,{ rowsJson, capturedAt:new Date().toISOString(), sourceUrl: profile?.treeUrl||'' }, [{ type:'rows-summary', total: rowsJson.totalLines, personLines: rowsJson.personLines, charLines: rowsJson.charLines }]); const statusByKit=st.statusByKit; statusByKit[kit]='yellow'; await saveStatusMap(statusByKit); setCurrentBox(profile,'yellow'); refreshStatusDots(st.session.profiles,statusByKit); updateStats(st.session.profiles, `Rows JSON built: ${rowsJson.personLines} person rows, ${rowsJson.charLines} char rows`);} catch(e){ console.error('Capture failed',e); alert('Capture failed: '+(e?.message||e)); } };
+  document.getElementById('btnCapture').onclick = async () => { const st=await getState(); const kit=st.focusedKit; if(!kit){ alert('No focused individual. Click Open on a row first.'); return;} try { const pre=await extractPreFromActiveTab(); const rowsJson=buildIntermediaryRows(pre); const built=buildFamiliesFromRowsV9(rowsJson); const profile=st.session.profiles.find(x=>x.Kit===kit); const gedcom=buildGedcom(built.people,{ kit }, built.families); await saveCapture(kit,{ rowsJson, gedcom, count: built.people.length, families: built.families.length, capturedAt:new Date().toISOString(), sourceUrl: profile?.treeUrl||'' }, built.logs); const statusByKit=st.statusByKit; statusByKit[kit]='yellow'; await saveStatusMap(statusByKit); setCurrentBox(profile,'yellow'); refreshStatusDots(st.session.profiles,statusByKit); updateStats(st.session.profiles, `Captured ${built.people.length} people, ${built.families.length} families`);} catch(e){ console.error('Capture failed',e); alert('Capture failed: '+(e?.message||e)); } };
 
   document.getElementById('btnFinalize').onclick = async () => { const st=await getState(); const kit=st.focusedKit; if(!kit) return; const statusByKit=st.statusByKit; statusByKit[kit]='green'; await saveStatusMap(statusByKit); const profile=st.session.profiles.find(x=>x.Kit===kit); setCurrentBox(profile,'green'); refreshStatusDots(st.session.profiles,statusByKit); };
 
