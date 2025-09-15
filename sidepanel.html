@@ -67,6 +67,11 @@
         <button id="btnDownloadRowsJson" class="btn">Download Rows JSON</button>
         <button id="btnViewLog" class="btn">View Parser Log</button>
       </div>
+      <div id="currentTrees" class="row" style="margin-top:6px;"></div>
+      <div class="controls" style="margin-top:6px;">
+        <button id="btnGetAllTrees" class="btn">Get All Trees (auto)</button>
+        <label class="muted" style="margin-left:8px;">Delay between captures (ms): <input id="autoDelayKit" type="number" min="0" step="100" style="width:90px;" /></label>
+      </div>
     </div>
 
     <div class="row">
@@ -87,6 +92,10 @@
     </div>
     <div class="row controls">
       <button id="openNext" class="btn">Open Next</button>
+      <button id="autoAllCsv" class="btn">Get All (auto)</button>
+      <button id="autoPause" class="btn">Pause</button>
+      <label class="muted" style="margin-left:8px;">Delay (ms): <input id="autoDelayAll" type="number" min="0" step="100" style="width:90px;" /></label>
+      <button id="downloadZipAll" class="btn">Download All GEDCOMs (zip)</button>
       <button id="exportJson" class="btn">Export JSON</button>
     </div>
     <script src="sidepanel.js"></script>

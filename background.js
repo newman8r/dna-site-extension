@@ -42,4 +42,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     });
     return true;
   }
+  if(msg && msg.type==='gm-nav-to-url' && msg.tabId && msg.url){
+    chrome.tabs.update(msg.tabId, { url: msg.url }, () => { sendResponse({ ok:true }); });
+    return true;
+  }
+  if(msg && msg.type==='gm-trees-detected'){
+    (async ()=>{
+      try{
+        const store=await chrome.storage.local.get(['gmGedmatchSession']);
+        const session=store.gmGedmatchSession||{ profiles:[], queueIndex:0, bundle:null };
+        const kit = msg.kit || (session.profiles[session.queueIndex-1]?.Kit);
+        if(kit){ const idx=session.profiles.findIndex(p=>p.Kit===kit); if(idx>=0){ session.profiles[idx].__trees=msg.trees||[]; await chrome.storage.local.set({ gmGedmatchSession: session }); } }
+        sendResponse({ ok:true });
+      } catch(e){ sendResponse({ ok:false, error: String(e) }); }
+    })();
+    return true;
+  }
 });

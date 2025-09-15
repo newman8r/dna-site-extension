@@ -26,28 +26,35 @@ function normalizeHeaderRow(rows) {
 }
 
 function toRecords(header, body) {
-  const idx = Object.fromEntries(header.map((h,i)=>[h.trim(), i]));
-  const get = (r,k)=>r[idx[k]] ?? '';
+  const normalize=(s)=>String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,'');
+  const idxNorm=new Map(); header.forEach((h,i)=>idxNorm.set(normalize(h), i));
+  const getByAny=(r,keys)=>{ for(const k of keys){ const i=idxNorm.get(normalize(k)); if(i!=null) return r[i] ?? ''; } return ''; };
   return body.map(r=>({
-    Kit: get(r,'Kit'),
-    Name: get(r,'Name'),
-    Email: get(r,'Email'),
-    GedLink: get(r,'GED WikiTree'),
-    Sex: get(r,'Sex'),
-    Source: get(r,'Source'),
-    Overlap: get(r,'Overlap')
+    Kit: getByAny(r,['Kit']),
+    Name: getByAny(r,['Name']),
+    Email: getByAny(r,['Email']),
+    GedLink: getByAny(r,['GED WikiTree','GEDWikiTree','GED Match','GedTree','Tree Link']),
+    Sex: getByAny(r,['Sex']),
+    AtdnaTotal: getByAny(r,['Total cM - Autosomal','Total cm - Autosomal','Total cM Autosomal','Total cm Autosomal','Autosomal Total cM','Autosomal Total cm']),
+    Source: getByAny(r,['Source']),
+    Overlap: getByAny(r,['Overlap'])
   }));
 }
 
-function resolveGedUrl(s) {
-  if (!s) return '';
-  const t = String(s).trim();
-  if (!t || t === 'null') return '';
-  if (/^https?:\/\//i.test(t)) {
-    try { const u = new URL(t); if (/\.gedmatch\.com$/i.test(u.hostname) && u.hostname !== 'pro.gedmatch.com') { u.hostname = 'pro.gedmatch.com'; return u.toString(); } return t; } catch {}
+function classifyGedLink(s) {
+  const out={ type:'none', url:'', raw: s||'' };
+  if(!s) return out; const t=String(s).trim(); if(!t || t==='null') return out;
+  let u=null; try { u = /^https?:\/\//i.test(t) ? new URL(t) : null; } catch {}
+  if(u){
+    const host=u.hostname.toLowerCase();
+    if(/wikitree\.com$/i.test(host)) { out.type='wikitree'; out.url=u.toString(); return out; }
+    if(/gedmatch\.com$/i.test(host)) { if(host!=='pro.gedmatch.com'){ u.hostname='pro.gedmatch.com'; } out.type='gedmatch'; out.url=u.toString(); return out; }
+    // unknown external; ignore
+    return out;
   }
-  if (t.startsWith('/')) return `https://pro.gedmatch.com${t}`;
-  return `https://pro.gedmatch.com/${t}`;
+  // relative path → gedmatch
+  const abs = t.startsWith('/') ? `https://pro.gedmatch.com${t}` : `https://pro.gedmatch.com/${t}`;
+  out.type='gedmatch'; out.url=abs; return out;
 }
 
 async function getState() {
@@ -84,6 +91,17 @@ function setCurrentBox(profile, status) {
   const dot = document.getElementById('currentDot');
   dot.classList.remove('red','yellow','green');
   dot.classList.add(statusToClass(status || 'red'));
+  // render tree links if present
+  const trees = (profile.__trees||[]);
+  const tgt = document.getElementById('currentTrees');
+  if (tgt) {
+    if (trees.length) {
+      const links = trees.map((t,idx)=>`<a href="${t.pedigreeUrl}" target="_blank">Tree ${idx+1}</a>`).join(' · ');
+      tgt.innerHTML = `<div class="muted">Detected ${trees.length} tree(s): ${links}</div>`;
+    } else {
+      tgt.innerHTML = '';
+    }
+  }
   box.classList.remove('hidden');
 }
 
@@ -119,8 +137,8 @@ function buildSessionFromText(text) {
   const rows = parseCsv(text);
   const { header, body } = normalizeHeaderRow(rows);
   if (header.length === 0) return { error: 'Invalid CSV: header not found' };
-  const recs = toRecords(header, body).map(r => ({ ...r, treeUrl: resolveGedUrl(r.GedLink) }));
-  const profiles = recs.filter(r => !!r.treeUrl);
+  const recs = toRecords(header, body).map(r => { const cl=classifyGedLink(r.GedLink); return { ...r, treeUrl: cl.type==='gedmatch'?cl.url:'', treeType: cl.type, rawTreeLink: cl.raw }; });
+  const profiles = recs.filter(r => r.treeType==='gedmatch');
   return { session: { profiles, queueIndex: 0, bundle: { exportedAt: new Date().toISOString(), source: { site: 'GEDmatch' }, profiles, captures: [] } } };
 }
 
@@ -412,7 +430,7 @@ function buildIntermediaryRows(result){
     // pipe scan for every row (both person and char rows can have pipes)
     const rowPipes=[]; for(let c=0;c<s.length;c++){ if(s[c]==='|') rowPipes.push(c); }
     // detect persons from anchors on this line
-    const persons=[]; {
+    const persons=[]; const controls=[]; {
       const matchIdxs=[];
       for(let ai=0; ai<anchors.length; ai++){
         const a=anchors[ai]; if(!a.label) continue; if(s.indexOf(a.label)!==-1) matchIdxs.push(ai);
@@ -422,21 +440,27 @@ function buildIntermediaryRows(result){
       if(chosenIdx!=null){
         const a=anchors[chosenIdx]; usedAnchor[chosenIdx]=true;
         const idx=s.indexOf(a.label);
-        const parsed=parsePersonLabel(a.label);
-        const sex=a.color==='red'?'F':a.color==='blue'?'M':'U';
-        const url=resolveGedUrl(a.href||'');
-        const indentRaw=idx; const px=a.x;
-        const rec={ label:a.label, name:parsed.name, birth:parsed.birth, death:parsed.death, sex, url, col:idx, indentRaw, px, indent:null, leadingSpaces:(s.match(/^\s*/)||[''])[0].length };
-        persons.push(rec); personRefs.push({ line:i, ref:rec });
+        // detect navigation/expand anchors (e.g., '=>', '>>', arrows) — labels with no letters
+        const isControl = !/[A-Za-z]/.test(a.label);
+        if(isControl){
+          controls.push({ kind:'expand', col: idx, label: a.label, href: resolveGedUrl(a.href||'') });
+        } else {
+          const parsed=parsePersonLabel(a.label);
+          const sex=a.color==='red'?'F':a.color==='blue'?'M':'U';
+          const url=resolveGedUrl(a.href||'');
+          const indentRaw=idx; const px=a.x;
+          const rec={ label:a.label, name:parsed.name, birth:parsed.birth, death:parsed.death, sex, url, col:idx, indentRaw, px, indent:null, leadingSpaces:(s.match(/^\s*/)||[''])[0].length };
+          persons.push(rec); personRefs.push({ line:i, ref:rec });
+        }
       }
     }
     if(persons.length){
-      rows.push({ idx:i, type:'person', persons, text:s, pipes: rowPipes, pipeCount: rowPipes.length }); personLines++; continue;
+      rows.push({ idx:i, type:'person', persons, text:s, pipes: rowPipes, pipeCount: rowPipes.length, controls }); personLines++; continue;
     }
     // char row tokens
     const pipes=[]; const lefts=[]; const rights=[]; for(let c=0;c<s.length;c++){ const ch=s[c]; if(ch==='|') pipes.push(c); else if(ch==='/') lefts.push(c); else if(ch==='\\') rights.push(c); }
     const segments=pairOutermost(lefts, rights);
-    if(pipes.length || lefts.length || rights.length){ rows.push({ idx:i, type:'char', pipes, pipeCount: pipes.length, lefts, rights, segments, text:s }); charLines++; }
+    if(pipes.length || lefts.length || rights.length || controls.length){ rows.push({ idx:i, type:'char', pipes, pipeCount: pipes.length, lefts, rights, segments, text:s, controls }); charLines++; }
   }
   // Quantize person indents to discrete levels using label column (fallback to pixel x if helpful)
   const cols=personRefs.map(r=>r.ref.col).sort((a,b)=>a-b);
@@ -581,27 +605,45 @@ function buildFamiliesFromRowsV9(rowsJson){
     }
   }
 
-  // Spouse inference: same indent, close columns, prefer differing sex
-  const spouseOf=new Map();
-  const levelSorted=people.slice().sort((a,b)=> b.indent-a.indent || a.col-b.col);
-  for(let i=0;i<levelSorted.length-1;i++){
-    const a=levelSorted[i], b=levelSorted[i+1];
-    if(a.indent===b.indent && Math.abs(a.col-b.col) <= Math.floor(indentStep*1.5) && !spouseOf.has(a.id) && !spouseOf.has(b.id)){
-      // Optional: require shared child to reduce false positives
-      const kidsA=new Set(a.children), kidsB=new Set(b.children); let shared=false; for(const c of kidsA){ if(kidsB.has(c)){ shared=true; break; } }
-      if(shared || a.sex!==b.sex || a.sex==='U' || b.sex==='U'){ spouseOf.set(a.id,b.id); spouseOf.set(b.id,a.id); }
-    }
+  // Phase 1: normalize child->parents (max two parents, choose by proximity)
+  for(const child of people){ if(!Array.isArray(child.parents)) child.parents=[]; if(child.parents.length<=2) continue;
+    // sort candidate parents by (indent desc, column proximity)
+    const sorted=child.parents.slice().sort((aId,bId)=>{
+      const a=people[aId], b=people[bId];
+      const indentCmp=(b.indent - a.indent);
+      if(indentCmp!==0) return indentCmp; const da=Math.abs((a.col||0) - (child.col||0)); const db=Math.abs((b.col||0) - (child.col||0));
+      return da - db;
+    });
+    const keep=new Set(sorted.slice(0,2));
+    child.parents = sorted.slice(0,2);
+    // remove back-links from dropped parents
+    for(const pid of sorted.slice(2)){ const idx=(people[pid].children||[]).indexOf(child.id); if(idx>=0) people[pid].children.splice(idx,1); }
   }
 
-  // Families from spouses and single parents
-  const families=[]; const famKeySet=new Set();
-  function pushFamily(parents, childList){ const key=parents.slice().sort((x,y)=>x-y).join('|'); let fam; if(!famKeySet.has(key)){ famKeySet.add(key); fam={ parents: parents.slice(0,2), children: [] }; families.push(fam); } else { fam=families.find(f=>f.parents.slice().sort((x,y)=>x-y).join('|')===key); }
-    for(const c of childList){ if(!fam.children.includes(c)) fam.children.push(c); } }
+  // Phase 2: derive families strictly from child parent-sets
+  const parentSetToChildren=new Map(); // key: parent ids sorted joined by '|'
+  for(const child of people){ const parents=(child.parents||[]).slice(0,2);
+    const sortedParents=parents.slice().sort((a,b)=>a-b);
+    const key=sortedParents.join('|');
+    if(!parentSetToChildren.has(key)) parentSetToChildren.set(key, new Set());
+    parentSetToChildren.get(key).add(child.id);
+  }
 
-  // Add spouse families
-  for(const p of people){ const s=spouseOf.get(p.id); if(s!=null && p.id<s){ const kids=new Set([...(people[p.id].children||[]), ...(people[s].children||[])]); pushFamily([p.id,s], Array.from(kids)); } }
-  // Add single-parent families
-  for(const p of people){ if(!spouseOf.has(p.id) && (p.children||[]).length){ pushFamily([p.id], p.children||[]); } }
+  // Phase 3: infer spouses from two-parent families only; avoid adjacency guesses
+  const spouseOf=new Map();
+  for(const [key, kids] of parentSetToChildren.entries()){
+    const ids=key.length? key.split('|').map(Number) : [];
+    if(ids.length===2){ const [a,b]=ids; spouseOf.set(a,b); spouseOf.set(b,a); }
+  }
+
+  // Phase 4: materialize families from parent-set groups
+  const families=[];
+  for(const [key, kids] of parentSetToChildren.entries()){
+    const ids=key.length? key.split('|').map(Number) : [];
+    // if key is empty (child with no detected parents), skip family creation
+    if(ids.length===0) continue;
+    families.push({ parents: ids.slice(0,2), children: Array.from(kids) });
+  }
 
   logs.push({ type:'v9-summary', people: people.length, families: families.length });
   return { people, families, logs };
@@ -633,7 +675,7 @@ function buildFamiliesFromRowsV8(rowsJson){
   for(const r of charRows){ const above=rowToPid.get(r.idx-1); const below=rowToPid.get(r.idx+1); if(above!=null && below!=null){ for(const p of (r.pipes||[])){ if(nearPid(above,p) && nearPid(below,p)) addEdge(below, above); } } }
 
   // Handle segments and single slashes
-  for(const r of charRows){ const above=rowToPid.get(r.idx-1); const below=rowToPid.get(r.idx+1); const txt=r.text||'';
+  for(const r of charRows){ if(r.controls?.length) continue; const above=rowToPid.get(r.idx-1); const below=rowToPid.get(r.idx+1); const txt=r.text||'';
     if((r.segments||[]).length){
       for(let si=0; si<r.segments.length; si++){
         const seg=r.segments[si]; const L=seg.L, R=seg.R, mid=seg.mid;
@@ -731,6 +773,7 @@ function buildFamiliesFromRows(rowsJson){
   for(let i=0; i<rows.length; i++){
     const r=rows[i];
     if(r.type!=='char') continue;
+    if(r.controls?.length) continue; // skip control-only rows (expand arrows)
     const active=charIdxToActive.get(r.idx)||new Set();
     
     // If child immediately above
@@ -1526,11 +1569,30 @@ function parseIndividualsFromPreV4(result){
 }
 
 function buildGedcom(people, meta, families){
+  // Identify root as the person with the minimum indent in the parsed tree
+  let rootIdx=-1; let minIndent=Number.POSITIVE_INFINITY;
+  for(let i=0;i<people.length;i++){ const ind=Number(people[i].indent||0); if(ind<minIndent){ minIndent=ind; rootIdx=i; } }
+  // Inject root (level 0) name from CSV kit when available
+  try {
+    const kitName=(meta?.rootName||'').trim();
+    if(kitName && rootIdx>=0){
+      const formatted=(function formatGedcomNameFromKit(raw){
+        const s=(raw||'').trim(); if(!s) return '';
+        if(s.startsWith('*')){ return s.replace(/^\*/,'').trim(); }
+        const tokens=s.split(/\s+/).filter(Boolean);
+        if(tokens.length===1) return tokens[0];
+        const surname=tokens[tokens.length-1];
+        const given=tokens.slice(0,-1).join(' ');
+        return `${given} /${surname}/`;
+      })(kitName);
+      if(formatted){ people[rootIdx].name=formatted; }
+    }
+  } catch(_){ }
   const now=new Date(); const yyyy=now.getFullYear(); const mm=String(now.getMonth()+1).padStart(2,'0'); const dd=String(now.getDate()).padStart(2,'0');
   const head=[ '0 HEAD','1 SOUR GedMapper','2 NAME GedMapper GEDmatch Capture','2 VERS 0.1','1 DATE '+`${yyyy}-${mm}-${dd}`,'1 SUBM @SUB1@','1 GEDC','2 VERS 5.5.1','2 FORM LINEAGE-LINKED','1 CHAR UTF-8' ]; if(meta?.kit) head.push('1 _OM_REFERENCE_KIT '+meta.kit);
   const subm=[ '0 @SUB1@ SUBM','1 NAME GEDmatch Importer User' ];
   const indiPtr = (i)=>`@I${i+1}@`; // index based on array order
-  const blocks = people.map((p,i)=>{ const lines=[`0 ${indiPtr(i)} INDI`, `1 NAME ${p.name || 'Unknown'}`, `1 SEX ${p.sex || 'U'}`]; if(p.birth?.date || p.birth?.place){ lines.push('1 BIRT'); if(p.birth.date) lines.push(`2 DATE ${p.birth.date}`); if(p.birth.place) lines.push(`2 PLAC ${p.birth.place}`);} if(p.death?.date || p.death?.place){ lines.push('1 DEAT'); if(p.death.date) lines.push(`2 DATE ${p.death.date}`); if(p.death.place) lines.push(`2 PLAC ${p.death.place}`);} if(p.url) lines.push(`1 NOTE _OM_SOURCE_URL ${p.url}`); return { lines, fLinks: [] }; });
+  const blocks = people.map((p,i)=>{ const lines=[`0 ${indiPtr(i)} INDI`, `1 NAME ${p.name || 'Unknown'}`, `1 SEX ${p.sex || 'U'}`]; if(p.birth?.date || p.birth?.place){ lines.push('1 BIRT'); if(p.birth.date) lines.push(`2 DATE ${p.birth.date}`); if(p.birth.place) lines.push(`2 PLAC ${p.birth.place}`);} if(p.death?.date || p.death?.place){ lines.push('1 DEAT'); if(p.death.date) lines.push(`2 DATE ${p.death.date}`); if(p.death.place) lines.push(`2 PLAC ${p.death.place}`);} if(p.url) lines.push(`1 _OM_SOURCE_URL ${p.url}`); if(i===rootIdx && (meta?.rootName)){ lines.push(`1 NOTE _OM_NAME_SOURCE gedmatch-csv`); lines.push(`1 NOTE Root name inferred from kit CSV: ${String(meta.rootName).trim()}`); lines.push('1 NOTE Root individual inferred from GEDmatch pedigree'); } if(i===rootIdx && meta?.atdnaTotal){ const val=String(meta.atdnaTotal).trim(); if(val) lines.push(`1 _OM_ATDNA ${val}`); } return { lines, fLinks: [] }; });
   // Families
   const famBlocks=[]; const famPtr=(i)=>`@F${i+1}@`;
   families.forEach((fam, fi)=>{
@@ -1558,7 +1620,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
 
   document.getElementById('clearSession').onclick = async () => { if(!confirm('This will permanently clear the loaded CSV, parsed list, statuses, and pending data. Continue?')) return; await chrome.storage.local.remove(['gmGedmatchSession','gmGedmatchPendingMeta','gmPendingCsvText','gmStatusByKit','gmFocusedKit','gmCapturedByKit','gmLogsByKit']); document.getElementById('rows').innerHTML=''; document.getElementById('currentBox').classList.add('hidden'); updateStats([],'Cleared'); };
 
-  document.getElementById('btnCapture').onclick = async () => { const st=await getState(); const kit=st.focusedKit; if(!kit){ alert('No focused individual. Click Open on a row first.'); return;} try { const pre=await extractPreFromActiveTab(); const rowsJson=buildIntermediaryRows(pre); const built=buildFamiliesFromRowsV9(rowsJson); const profile=st.session.profiles.find(x=>x.Kit===kit); const gedcom=buildGedcom(built.people,{ kit }, built.families); await saveCapture(kit,{ rowsJson, gedcom, count: built.people.length, families: built.families.length, capturedAt:new Date().toISOString(), sourceUrl: profile?.treeUrl||'' }, built.logs); const statusByKit=st.statusByKit; statusByKit[kit]='yellow'; await saveStatusMap(statusByKit); setCurrentBox(profile,'yellow'); refreshStatusDots(st.session.profiles,statusByKit); updateStats(st.session.profiles, `Captured ${built.people.length} people, ${built.families.length} families`);} catch(e){ console.error('Capture failed',e); alert('Capture failed: '+(e?.message||e)); } };
+  document.getElementById('btnCapture').onclick = async () => { const st=await getState(); const kit=st.focusedKit; if(!kit){ alert('No focused individual. Click Open on a row first.'); return;} try { const pre=await extractPreFromActiveTab(); const rowsJson=buildIntermediaryRows(pre); const built=buildFamiliesFromRowsV9(rowsJson); const profile=st.session.profiles.find(x=>x.Kit===kit); const gedcom=buildGedcom(built.people,{ kit, rootName: profile?.Name||'', atdnaTotal: profile?.AtdnaTotal||'' }, built.families); await saveCapture(kit,{ rowsJson, gedcom, count: built.people.length, families: built.families.length, capturedAt:new Date().toISOString(), sourceUrl: profile?.treeUrl||'' }, built.logs); const statusByKit=st.statusByKit; statusByKit[kit]='yellow'; await saveStatusMap(statusByKit); setCurrentBox(profile,'yellow'); refreshStatusDots(st.session.profiles,statusByKit); updateStats(st.session.profiles, `Captured ${built.people.length} people, ${built.families.length} families`);} catch(e){ console.error('Capture failed',e); alert('Capture failed: '+(e?.message||e)); } };
 
   document.getElementById('btnFinalize').onclick = async () => { const st=await getState(); const kit=st.focusedKit; if(!kit) return; const statusByKit=st.statusByKit; statusByKit[kit]='green'; await saveStatusMap(statusByKit); const profile=st.session.profiles.find(x=>x.Kit===kit); setCurrentBox(profile,'green'); refreshStatusDots(st.session.profiles,statusByKit); };
 
@@ -1566,12 +1628,133 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
 
   document.getElementById('btnCaptureSub').onclick = () => { alert('Capture Subtree: coming soon'); };
 
+  // Auto-capture all detected tree links for the focused kit
+  document.getElementById('btnGetAllTrees').onclick = async () => {
+    const st=await getState(); const kit=st.focusedKit; if(!kit){ alert('No focused individual.'); return; }
+    const session=(await getState()).session; const p=session.profiles.find(x=>x.Kit===kit); const trees=(p?.__trees||[]);
+    if(!trees.length){ alert('No tree list detected for this kit yet. Open the kit link first.'); return; }
+    const delayMs = Number(document.getElementById('autoDelayKit').value||'1000');
+    let captured=0; for(const t of trees){
+      try{
+        const tab=await chrome.tabs.create({ url:t.pedigreeUrl, active:false });
+        await new Promise(r=>setTimeout(r, 800));
+        const pre=await extractPreFromActiveTab(); // operates on active tab; switch
+        await chrome.tabs.update(tab.id, { active:true });
+        const rowsJson=buildIntermediaryRows(pre);
+        const built=buildFamiliesFromRowsV9(rowsJson);
+        const profile=session.profiles.find(x=>x.Kit===kit);
+        const gedcom=buildGedcom(built.people,{ kit, rootName: profile?.Name||'', atdnaTotal: profile?.AtdnaTotal||'' }, built.families);
+        await saveCapture(kit,{ rowsJson, gedcom, count: built.people.length, families: built.families.length, capturedAt:new Date().toISOString(), sourceUrl: t.pedigreeUrl }, built.logs);
+        captured++;
+        await chrome.tabs.remove(tab.id);
+        if(delayMs>0) await new Promise(r=>setTimeout(r, delayMs));
+      } catch(e){ console.error('Auto capture failed', e); }
+    }
+    alert(`Auto-captured ${captured}/${trees.length} trees`);
+  };
+
+  // Auto run across the entire CSV using a fresh tab per profile for reliability
+  document.getElementById('autoAllCsv').onclick = async () => {
+    const st=await getState(); const profiles=st.session.profiles||[]; if(!profiles.length){ alert('No profiles loaded.'); return; }
+    await chrome.storage.local.set({ gmAutoPaused:false });
+    const delayMs = Number(document.getElementById('autoDelayAll').value||'1000');
+    let completed=0;
+    for(const p of profiles){ try{
+      const paused=(await chrome.storage.local.get(['gmAutoPaused']))?.gmAutoPaused; if(paused) break;
+      if(!p.treeUrl) continue;
+      const tab=await chrome.tabs.create({ url:p.treeUrl, active:true });
+      await navLog(p.Kit,{ step:'auto-all-opened', url:p.treeUrl });
+      await waitForTabComplete(tab.id);
+      // Wait until we're on pedigree with a <pre>
+      let ok=await waitForPedigree(tab.id, 25000);
+      if(!ok){ const res=await autoNavigateToPedigree(tab.id); if(res?.nextUrl){ await chrome.runtime.sendMessage({ type:'gm-nav-to-url', tabId:tab.id, url:res.nextUrl }); await waitForTabComplete(tab.id); ok=await waitForPedigree(tab.id, 15000); } }
+      if(!ok){ await navLog(p.Kit,{ step:'auto-all-skip-no-pedigree' }); await chrome.tabs.remove(tab.id); continue; }
+      const pre=await extractPreFromActiveTab();
+      const rowsJson=buildIntermediaryRows(pre);
+      const built=buildFamiliesFromRowsV9(rowsJson);
+      const gedcom=buildGedcom(built.people,{ kit:p.Kit, rootName: p?.Name||'', atdnaTotal: p?.AtdnaTotal||'' }, built.families);
+      await saveCapture(p.Kit,{ rowsJson, gedcom, count: built.people.length, families: built.families.length, capturedAt:new Date().toISOString(), sourceUrl: pre?.frame||p.treeUrl }, built.logs);
+      completed++;
+      const statusByKit=(await getState()).statusByKit; statusByKit[p.Kit]='yellow'; await saveStatusMap(statusByKit);
+      renderList((await getState()).session.profiles, statusByKit);
+      if(delayMs>0) await new Promise(r=>setTimeout(r, delayMs));
+      await chrome.tabs.remove(tab.id);
+    } catch(e){ console.error('Auto all failed for', p.Kit, e); await navLog(p.Kit,{ step:'auto-all-error', error:String(e) }); }
+    }
+    alert(`Auto captured ${completed}/${profiles.length}`);
+  };
+
+  // Pause/Resume toggle for auto capture
+  document.getElementById('autoPause').onclick = async () => {
+    const store=await chrome.storage.local.get(['gmAutoPaused']); const paused=!!store.gmAutoPaused; const next=!paused; await chrome.storage.local.set({ gmAutoPaused: next });
+    document.getElementById('autoPause').textContent = next ? 'Resume' : 'Pause';
+  };
+
+  // Bundle all captured GEDCOMs into a zip and download
+  document.getElementById('downloadZipAll').onclick = async () => {
+    const store=await chrome.storage.local.get(['gmCapturedByKit']);
+    const captured=store.gmCapturedByKit||{}; const entries=Object.entries(captured).filter(([,v])=>v?.gedcom);
+    if(!entries.length){ alert('No GEDCOMs captured yet.'); return; }
+    const enc=new TextEncoder();
+    const files = entries.map(([kit,v])=>({name:`gedmatch-capture-${kit}.ged`, data:enc.encode(v.gedcom)}));
+    function dosDateTime(dt){ const d=dt||new Date(); const time=(d.getHours()<<11)|(d.getMinutes()<<5)|((d.getSeconds()/2)|0); const date=((d.getFullYear()-1980)<<9)|((d.getMonth()+1)<<5)|d.getDate(); return {time,date}; }
+    const parts=[]; const centrals=[]; let offset=0; for(const f of files){ const {time,date}=dosDateTime(new Date()); const nameBytes=enc.encode(f.name);
+      const lh=new Uint8Array(30+nameBytes.length); const dv=new DataView(lh.buffer);
+      dv.setUint32(0,0x04034b50,true); dv.setUint16(4,20,true); dv.setUint16(6,0,true); dv.setUint16(8,0,true); dv.setUint16(10,time,true); dv.setUint16(12,date,true); dv.setUint32(14,0,true); dv.setUint32(18,f.data.length,true); dv.setUint32(22,f.data.length,true); dv.setUint16(26,nameBytes.length,true); dv.setUint16(28,0,true); lh.set(nameBytes,30);
+      parts.push(lh, f.data);
+      const ch=new Uint8Array(46+nameBytes.length); const dv2=new DataView(ch.buffer);
+      dv2.setUint32(0,0x02014b50,true); dv2.setUint16(4,20,true); dv2.setUint16(6,20,true); dv2.setUint16(8,0,true); dv2.setUint16(10,0,true); dv2.setUint16(12,time,true); dv2.setUint16(14,date,true); dv2.setUint32(16,0,true); dv2.setUint32(20,f.data.length,true); dv2.setUint32(24,f.data.length,true); dv2.setUint16(28,nameBytes.length,true); dv2.setUint16(30,0,true); dv2.setUint16(32,0,true); dv2.setUint16(34,0,true); dv2.setUint16(36,0,true); dv2.setUint32(38,0,true); dv2.setUint32(42,offset,true); ch.set(nameBytes,46);
+      centrals.push(ch); offset += lh.length + f.data.length; }
+    const centralSize=centrals.reduce((a,b)=>a+b.length,0); const eocd=new Uint8Array(22); const dv3=new DataView(eocd.buffer);
+    dv3.setUint32(0,0x06054b50,true); dv3.setUint16(4,0,true); dv3.setUint16(6,0,true); dv3.setUint16(8,files.length,true); dv3.setUint16(10,files.length,true); dv3.setUint32(12,centralSize,true); dv3.setUint32(16,offset,true); dv3.setUint16(20,0,true);
+    const blob=new Blob([...parts, ...centrals, eocd], { type:'application/zip' });
+    const url=URL.createObjectURL(blob); const filename=`gedmatch-captures-${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.zip`;
+    await chrome.downloads.download({ url, filename, saveAs:true }); setTimeout(()=>URL.revokeObjectURL(url), 10000);
+  };
+
   document.getElementById('btnDownloadGedcom').onclick = async () => { const st=await getState(); const kit=st.focusedKit; if(!kit){ alert('No focused individual.'); return;} const cap=st.capturedByKit[kit]; if(!cap?.gedcom){ alert('No captured GEDCOM for this kit yet. Click Capture Tree first.'); return;} const blob=new Blob([cap.gedcom], { type:'text/plain' }); const url=URL.createObjectURL(blob); const filename=`gedmatch-capture-${kit}.ged`; await chrome.downloads.download({ url, filename, saveAs: true }); setTimeout(()=>URL.revokeObjectURL(url), 10000); };
   document.getElementById('btnDownloadRowsJson').onclick = async () => { const st=await getState(); const kit=st.focusedKit; if(!kit){ alert('No focused individual.'); return;} const store=await chrome.storage.local.get(['gmCapturedByKit']); const cap=store.gmCapturedByKit?.[kit]; if(!cap?.rowsJson){ alert('No captured Rows JSON yet. Click Capture Tree first.'); return;} const blob=new Blob([JSON.stringify(cap.rowsJson, null, 2)], { type:'application/json' }); const url=URL.createObjectURL(blob); const filename=`gedmatch-rows-${kit}.json`; await chrome.downloads.download({ url, filename, saveAs:true }); setTimeout(()=>URL.revokeObjectURL(url), 10000); };
 
   document.getElementById('btnViewLog').onclick = async () => { const st=await getState(); const kit=st.focusedKit; if(!kit){ alert('No focused individual.'); return;} const logs=(await getState()).logsByKit?.[kit]; if(!logs || !logs.length){ alert('No logs captured yet. Click Capture Tree to generate logs.'); return;} const blob=new Blob([JSON.stringify(logs, null, 2)], { type:'application/json' }); const url=URL.createObjectURL(blob); const filename=`gedmatch-capture-log-${kit}.json`; await chrome.downloads.download({ url, filename, saveAs: true }); setTimeout(()=>URL.revokeObjectURL(url), 10000); };
 
-  document.getElementById('openNext').onclick = async () => { const s=(await getState()).session; if(!s.profiles?.length) return; const i=Math.max(0, Math.min(s.queueIndex||0, s.profiles.length-1)); const p=s.profiles[i]; s.queueIndex=i+1; await saveSession(s); setCurrentBox(p, (await getState()).statusByKit[p.Kit]||'red'); if(p?.treeUrl) await chrome.tabs.create({ url:p.treeUrl, active:true }); };
+  async function navLog(kit, entry){ try{ const store=await chrome.storage.local.get(['gmLogsByKit']); const logs=store.gmLogsByKit||{}; if(!logs[kit]) logs[kit]=[]; logs[kit].push({ t:new Date().toISOString(), source:'nav', ...entry }); await chrome.storage.local.set({ gmLogsByKit: logs }); }catch(e){ /* ignore */ } }
+
+  function waitForTabComplete(tabId, timeoutMs=15000){ return new Promise(resolve=>{ let done=false; const timer=setTimeout(()=>{ if(done) return; done=true; chrome.tabs.onUpdated.removeListener(listener); resolve(false); }, timeoutMs); const listener=(id, info)=>{ if(id===tabId && info.status==='complete'){ if(done) return; done=true; clearTimeout(timer); chrome.tabs.onUpdated.removeListener(listener); resolve(true); } }; chrome.tabs.onUpdated.addListener(listener); }); }
+
+  // Listen for tree-detected messages to update UI immediately
+  chrome.runtime.onMessage.addListener(async (msg) => {
+    if(msg && msg.type==='gm-trees-detected'){ const st=await getState(); const s=st.session; const kit=msg.kit || st.focusedKit; if(!kit) return; const idx=s.profiles.findIndex(p=>p.Kit===kit); if(idx>=0){ s.profiles[idx].__trees=msg.trees||[]; await saveSession(s); setCurrentBox(s.profiles[idx], (await getState()).statusByKit[kit]||'red'); } }
+  });
+
+  document.getElementById('openNext').onclick = async () => { const st=await getState(); const s=st.session; if(!s.profiles?.length) return; const i=Math.max(0, Math.min(s.queueIndex||0, s.profiles.length-1)); const p=s.profiles[i]; s.queueIndex=i+1; await saveSession(s); setCurrentBox(p, (await getState()).statusByKit[p.Kit]||'red'); if(p?.treeUrl) { const tab=await chrome.tabs.create({ url:p.treeUrl, active:true }); await navLog(p.Kit,{ step:'opened-kit-url', url:p.treeUrl }); const loaded=await waitForTabComplete(tab.id); await navLog(p.Kit,{ step:'kit-page-complete', loaded }); const res=await autoNavigateToPedigree(tab.id); await navLog(p.Kit,{ step:'auto-navigate', mode:res?.mode||null, trees:(res?.trees||[]).length, nextUrl: res?.nextUrl||null }); if(res?.nextUrl){ try{ await chrome.runtime.sendMessage({ type:'gm-nav-to-url', tabId:tab.id, url:res.nextUrl }); await navLog(p.Kit,{ step:'background-nav', url:res.nextUrl }); }catch(e){ await navLog(p.Kit,{ step:'background-nav-error', error:String(e) }); } } if(res?.trees?.length){ const s2=(await getState()).session; const idx=s2.profiles.findIndex(x=>x.Kit===p.Kit); if(idx>=0){ s2.profiles[idx].__trees=res.trees; await saveSession(s2); setCurrentBox(s2.profiles[idx], (await getState()).statusByKit[p.Kit]||'red'); } } } };
+  
+  // Auto-navigate helper: when a 'find-gedcoms-by-kit' table is present, pick first tree and open pedigree; otherwise, on individual page, open Pedigree
+  async function autoNavigateToPedigree(tabId){
+    if(!tabId) return null;
+    const [{ result } = {}] = await chrome.scripting.executeScript({ target:{tabId, allFrames:false}, func:()=>{
+      try{
+        const origin = location.origin;
+        const data={ mode:'', trees:[], nextUrl:null };
+        const table=document.querySelector('#gedcoms-table');
+        if(table){
+          const links=Array.from(table.querySelectorAll('tbody a[href*="/tools/gedcom/individual"]'));
+          data.mode='list';
+          data.trees=links.map(a=>{ const u=new URL(a.getAttribute('href'), origin); const id_family=u.searchParams.get('id_family'); const id_ged=u.searchParams.get('id_ged'); const pedigreeUrl=`${origin}/tools/gedcom/pedigree-chart?id_family=${encodeURIComponent(id_family)}&id_ged=${encodeURIComponent(id_ged)}`; return { individualUrl: u.toString(), pedigreeUrl, email:(a.textContent||'').trim() }; });
+          if(data.trees[0]){ data.nextUrl=data.trees[0].pedigreeUrl; }
+          return data;
+        }
+        // Individual page
+        const url=new URL(location.href);
+        if(url.pathname.includes('/tools/gedcom/individual')){
+          const id_family=url.searchParams.get('id_family'); const id_ged=url.searchParams.get('id_ged');
+          if(id_family&&id_ged){ const ped=`${origin}/tools/gedcom/pedigree-chart?id_family=${encodeURIComponent(id_family)}&id_ged=${encodeURIComponent(id_ged)}`; return { mode:'individual', trees:[{ individualUrl:url.toString(), pedigreeUrl: ped }], nextUrl: ped }; }
+        }
+        if(location.pathname.includes('/tools/gedcom/pedigree-chart')) return { mode:'already-pedigree', trees:[], nextUrl:null };
+        return { mode:'no-op', trees:[], nextUrl:null };
+      }catch(e){ return { mode:'error', error:e.message, trees:[], nextUrl:null }; }
+    }});
+    return result||null;
+  }
 
   document.getElementById('exportJson').onclick = async () => { const s=(await getState()).session; const blob=new Blob([JSON.stringify(s.bundle||{}, null, 2)], { type:'application/json' }); const url=URL.createObjectURL(blob); const filename=`gedmatch-import-${new Date().toISOString().replace(/[:.]/g,'-')}.json`; await chrome.downloads.download({ url, filename, saveAs:true }); setTimeout(()=>URL.revokeObjectURL(url), 10000); };
 
