@@ -38,6 +38,14 @@
       <button id="parseBtn" class="btn btn-primary">Parse CSV</button>
       <span id="stats" class="pill">No file</span>
     </div>
+    <div class="row">
+      <input id="segCsvFile" type="file" accept=".csv" />
+      <div class="muted">Optional: Load GEDmatch one-to-one segments CSV</div>
+    </div>
+    <div class="row controls">
+      <button id="segParseBtn" class="btn">Parse Segments CSV</button>
+      <span id="segStats" class="pill">Segments: 0 kits</span>
+    </div>
     <div class="row controls">
       <button id="clearSession" class="btn btn-danger">Clear Session</button>
       <span class="muted">Warning: this permanently clears the loaded CSV, list, statuses, and pending data.</span>
@@ -94,6 +102,13 @@
       <button id="autoAllCsv" class="btn">Get All (auto)</button>
       <button id="downloadZipAll" class="btn">Download All GEDCOMs (zip)</button>
       <button id="exportJson" class="btn">Export JSON</button>
+    </div>
+    <div class="row">
+      <label><input type="checkbox" id="includeFloatingIndis" /> add floating individuals</label>
+      <div class="controls">
+        <label class="muted">Min Total cM <input id="minAtdna" type="number" step="0.1" style="width:100px" /></label>
+        <label class="muted">Min Largest cM <input id="minLargest" type="number" step="0.1" style="width:110px" /></label>
+      </div>
     </div>
     <script src="sidepanel.js"></script>
   </body>

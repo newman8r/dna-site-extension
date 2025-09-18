@@ -36,6 +36,7 @@ function toRecords(header, body) {
     GedLink: getByAny(r,['GED WikiTree','GEDWikiTree','GED Match','GedTree','Tree Link']),
     Sex: getByAny(r,['Sex']),
     AtdnaTotal: getByAny(r,['Total cM - Autosomal','Total cm - Autosomal','Total cM Autosomal','Total cm Autosomal','Autosomal Total cM','Autosomal Total cm']),
+    LargestCm: getByAny(r,['Largest - Autosomal','Largest cM - Autosomal','LargestcmAutosomal','Largest cM','Largest cm']),
     Source: getByAny(r,['Source']),
     Overlap: getByAny(r,['Overlap'])
   }));
@@ -69,7 +70,7 @@ function resolveGedUrl(s){
 }
 
 async function getState() {
-  const s = await chrome.storage.local.get(['gmGedmatchSession','gmGedmatchPendingMeta','gmPendingCsvText','gmStatusByKit','gmFocusedKit','gmCapturedByKit','gmLogsByKit']);
+  const s = await chrome.storage.local.get(['gmGedmatchSession','gmGedmatchPendingMeta','gmPendingCsvText','gmStatusByKit','gmFocusedKit','gmCapturedByKit','gmLogsByKit','gmAllCsvRecords']);
   return {
     session: s.gmGedmatchSession || { profiles: [], queueIndex: 0, bundle: null },
     pendingMeta: s.gmGedmatchPendingMeta || null,
@@ -77,7 +78,8 @@ async function getState() {
     statusByKit: s.gmStatusByKit || {},
     focusedKit: s.gmFocusedKit || null,
     capturedByKit: s.gmCapturedByKit || {},
-    logsByKit: s.gmLogsByKit || {}
+    logsByKit: s.gmLogsByKit || {},
+    allRecords: s.gmAllCsvRecords || []
   };
 }
 
@@ -144,13 +146,41 @@ function updateStats(profiles, extra) {
   document.getElementById('stats').textContent = extra ? `${base} • ${extra}` : base;
 }
 
+// Segments CSV parsing and storage
+function buildSegmentsFromText(text){
+  const rows=parseCsv(text);
+  if(!rows.length) return { kits: new Set(), segments: [] };
+  const header=rows[0]; const body=rows.slice(1);
+  const normalize=(s)=>String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,'');
+  const idxNorm=new Map(); header.forEach((h,i)=>idxNorm.set(normalize(h), i));
+  const col=(name)=>{ const i=idxNorm.get(normalize(name)); return i==null?-1:i; };
+  const iPrimary=col('PrimaryKit'); const iMatched=col('MatchedKit'); const iChr=col('Chr'); const iStart=col('B37 Start'); const iEnd=col('B37 End'); const iCm=col('Segment cM'); const iSnps=col('SNPs'); const iName=col('MatchedName'); const iSex=col('Matched Sex'); const iEmail=col('MatchedEmail');
+  const kitsSet=new Set(); const segs=[];
+  for(const r of body){
+    const primary=r[iPrimary]||''; const matched=r[iMatched]||''; if(primary||matched){ kitsSet.add(primary); kitsSet.add(matched); }
+    segs.push({
+      primaryKit: primary,
+      matchedKit: matched,
+      chr: r[iChr]||'',
+      b37Start: r[iStart]||'',
+      b37End: r[iEnd]||'',
+      cm: r[iCm]||'',
+      snps: r[iSnps]||'',
+      matchedName: r[iName]||'',
+      matchedSex: r[iSex]||'',
+      matchedEmail: r[iEmail]||''
+    });
+  }
+  return { kits: Array.from(kitsSet).filter(Boolean), segments: segs };
+}
+
 function buildSessionFromText(text) {
   const rows = parseCsv(text);
   const { header, body } = normalizeHeaderRow(rows);
   if (header.length === 0) return { error: 'Invalid CSV: header not found' };
   const recs = toRecords(header, body).map(r => { const cl=classifyGedLink(r.GedLink); return { ...r, treeUrl: cl.type==='gedmatch'?cl.url:'', treeType: cl.type, rawTreeLink: cl.raw }; });
   const profiles = recs.filter(r => r.treeType==='gedmatch');
-  return { session: { profiles, queueIndex: 0, bundle: { exportedAt: new Date().toISOString(), source: { site: 'GEDmatch' }, profiles, captures: [] } } };
+  return { session: { profiles, queueIndex: 0, bundle: { exportedAt: new Date().toISOString(), source: { site: 'GEDmatch' }, profiles, captures: [] } }, allRecords: recs };
 }
 
 const MONTHS = { jan:'JAN', feb:'FEB', mar:'MAR', apr:'APR', may:'MAY', jun:'JUN', jul:'JUL', aug:'AUG', sep:'SEP', sept:'SEP', oct:'OCT', nov:'NOV', dec:'DEC' };
@@ -1626,10 +1656,15 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
 (async function main(){
   const state = await getState();
   const fileInput = document.getElementById('csvFile');
+  const segFileInput = document.getElementById('segCsvFile');
 
   fileInput.addEventListener('change', async () => { const file=fileInput.files[0]; if(!file) return; try { const text=await file.text(); await chrome.storage.local.set({ gmPendingCsvText:text, gmGedmatchPendingMeta:{ name:file.name, size:file.size, lastModified:file.lastModified } }); updateStats(state.session.profiles, `Pending: ${file.name}`);} catch(e){ updateStats(state.session.profiles,'Failed to read file'); }});
 
-  document.getElementById('parseBtn').onclick = async () => { const s=await getState(); if(!s.pendingText){ updateStats(s.session.profiles,'No pending file'); return;} const built=buildSessionFromText(s.pendingText); if(built.error){ updateStats([],built.error); return;} await saveSession(built.session); const statusByKit=(await getState()).statusByKit; for(const p of built.session.profiles) if(!statusByKit[p.Kit]) statusByKit[p.Kit]='red'; await saveStatusMap(statusByKit); renderList(built.session.profiles,statusByKit); updateStats(built.session.profiles, s.pendingMeta?.name?`Loaded: ${s.pendingMeta.name}`:undefined); chrome.storage.local.remove(['gmPendingCsvText','gmGedmatchPendingMeta']); };
+  segFileInput.addEventListener('change', async () => { const file=segFileInput.files[0]; if(!file) return; try { const text=await file.text(); const built=buildSegmentsFromText(text); await chrome.storage.local.set({ gmSegmentsCsvMeta:{ name:file.name, size:file.size, lastModified:file.lastModified }, gmSegmentsData: built }); const kits=(built?.kits||[]).length; const el=document.getElementById('segStats'); if(el) el.textContent=`Segments: ${kits} kits`; } catch(e){ const el=document.getElementById('segStats'); if(el) el.textContent='Segments: failed to read'; } });
+
+  document.getElementById('parseBtn').onclick = async () => { const s=await getState(); if(!s.pendingText){ updateStats(s.session.profiles,'No pending file'); return;} const built=buildSessionFromText(s.pendingText); if(built.error){ updateStats([],built.error); return;} await saveSession(built.session); await chrome.storage.local.set({ gmAllCsvRecords: built.allRecords||[] }); const statusByKit=(await getState()).statusByKit; for(const p of built.session.profiles) if(!statusByKit[p.Kit]) statusByKit[p.Kit]='red'; await saveStatusMap(statusByKit); renderList(built.session.profiles,statusByKit); updateStats(built.session.profiles, s.pendingMeta?.name?`Loaded: ${s.pendingMeta.name}`:undefined); chrome.storage.local.remove(['gmPendingCsvText','gmGedmatchPendingMeta']); };
+
+  document.getElementById('segParseBtn').onclick = async () => { try { const store=await chrome.storage.local.get(['gmSegmentsData','gmSegmentsCsvMeta']); const kits=(store.gmSegmentsData?.kits||[]).length||0; const el=document.getElementById('segStats'); if(el) el.textContent=`Segments: ${kits} kits${store.gmSegmentsCsvMeta?.name?` • ${store.gmSegmentsCsvMeta.name}`:''}`; } catch(e){} };
 
   document.getElementById('clearSession').onclick = async () => { if(!confirm('This will permanently clear the loaded CSV, parsed list, statuses, and pending data. Continue?')) return; await chrome.storage.local.remove(['gmGedmatchSession','gmGedmatchPendingMeta','gmPendingCsvText','gmStatusByKit','gmFocusedKit','gmCapturedByKit','gmLogsByKit']); document.getElementById('rows').innerHTML=''; document.getElementById('currentBox').classList.add('hidden'); updateStats([],'Cleared'); };
 
@@ -1690,11 +1725,47 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
 
   // Bundle all captured GEDCOMs into a zip and download
   document.getElementById('downloadZipAll').onclick = async () => {
-    const store=await chrome.storage.local.get(['gmCapturedByKit']);
+    const store=await chrome.storage.local.get(['gmCapturedByKit','gmGedmatchSession','gmSegmentsData']);
     const captured=store.gmCapturedByKit||{}; const entries=Object.entries(captured).filter(([,v])=>v?.gedcom);
     if(!entries.length){ alert('No GEDCOMs captured yet.'); return; }
     const enc=new TextEncoder();
     const files = entries.map(([kit,v])=>({name:`gedmatch-capture-${kit}.ged`, data:enc.encode(v.gedcom)}));
+
+    // Optionally include floating individuals GEDCOM
+    const includeFloating=document.getElementById('includeFloatingIndis')?.checked;
+    if(includeFloating){
+      // Use full autosomal CSV records we persisted during Parse CSV
+      const s=await getState();
+      const allRecords=s.allRecords||[];
+      // Build set of kits that already have a captured GEDCOM to avoid duplication
+      const kitsWithTree=new Set(Object.keys(captured));
+      // Filter floating: present in one-to-many, but no captured GEDCOM
+      const floating=allRecords.filter(r=>r?.Kit && !kitsWithTree.has(r.Kit));
+
+      // Apply thresholds
+      const minAtdna=parseFloat(document.getElementById('minAtdna')?.value||'0')||0;
+      const minLargest=parseFloat(document.getElementById('minLargest')?.value||'0')||0;
+      const pass=floating.filter(r=>{
+        const a=parseFloat(String(r.AtdnaTotal).replace(/[^0-9.]/g,''))||0;
+        const l=parseFloat(String(r.LargestCm).replace(/[^0-9.]/g,''))||0;
+        return a>=minAtdna && l>=minLargest;
+      });
+
+      // Build a minimal GEDCOM with individuals only, include _OM_ATDNA like root handling
+      const lines=[]; lines.push('0 HEAD','1 GEDC','2 VERS 5.5.1','1 CHAR UTF-8','1 SOUR GEDMATCH-IMPORTER');
+      lines.push('0 @SUB1@ SUBM','1 NAME GEDmatch Importer User');
+      const idFor=(i)=>`@I${i+1}@`;
+      pass.forEach((r,i)=>{
+        const name=(r.Name||'Unknown'); const sex=r.Sex||'U';
+        lines.push(`0 ${idFor(i)} INDI`);
+        lines.push(`1 NAME ${name}`);
+        lines.push(`1 SEX ${sex}`);
+        const at=String(r.AtdnaTotal||'').trim(); if(at) lines.push(`1 _OM_ATDNA ${at}`);
+        if(r.GedLink) { const cl=classifyGedLink(r.GedLink); if(cl.url) lines.push(`1 _OM_SOURCE_URL ${cl.url}`); }
+      });
+      lines.push('0 TRLR');
+      files.push({ name:'gedmatch-floating-individuals.ged', data: enc.encode(lines.join('\n')) });
+    }
     function dosDateTime(dt){ const d=dt||new Date(); const time=(d.getHours()<<11)|(d.getMinutes()<<5)|((d.getSeconds()/2)|0); const date=((d.getFullYear()-1980)<<9)|((d.getMonth()+1)<<5)|d.getDate(); return {time,date}; }
     const parts=[]; const centrals=[]; let offset=0; for(const f of files){ const {time,date}=dosDateTime(new Date()); const nameBytes=enc.encode(f.name);
       const lh=new Uint8Array(30+nameBytes.length); const dv=new DataView(lh.buffer);
