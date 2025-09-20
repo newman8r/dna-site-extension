@@ -174,6 +174,11 @@ function buildSegmentsFromText(text){
   return { kits: Array.from(kitsSet).filter(Boolean), segments: segs };
 }
 
+// Build an index: kit -> list of segment rows involving that kit
+function buildSegmentsIndex(segments){ const map=new Map(); if(!Array.isArray(segments)) return map; for(const s of segments){ const a=(s?.primaryKit||'').trim(); const b=(s?.matchedKit||'').trim(); if(a){ if(!map.has(a)) map.set(a,[]); map.get(a).push(s); } if(b){ if(!map.has(b)) map.set(b,[]); map.get(b).push(s); } } return map; }
+
+function emitSegmentLinesForKit(kit, segList){ const lines=[]; if(!kit||!Array.isArray(segList)) return lines; for(const s of segList){ const pk=(s.primaryKit||'').trim(); const mk=(s.matchedKit||'').trim(); const chr=String(s.chr||'').trim(); const st=String(s.b37Start||'').trim(); const en=String(s.b37End||'').trim(); const cm=String(s.cm||'').trim(); lines.push('1 _OM_SEGMENT_DATA'); lines.push(`2 _OM_PRIMARY_KIT ${pk}`); lines.push(`2 _OM_MATCHED_KIT ${mk}`); lines.push(`2 _OM_CHROMOSOME ${chr}`); lines.push('2 _OM_BUILD B37'); lines.push(`2 _OM_SEGMENT_START ${st}`); lines.push(`2 _OM_SEGMENT_END ${en}`); lines.push(`2 _OM_SEGMENT_CM ${cm}`); lines.push('2 _OM_KIT_SOURCE GEDMATCH'); } return lines; }
+
 function buildSessionFromText(text) {
   const rows = parseCsv(text);
   const { header, body } = normalizeHeaderRow(rows);
@@ -1611,7 +1616,7 @@ function parseIndividualsFromPreV4(result){
   return { people, families: merged, logs };
 }
 
-function buildGedcom(people, meta, families){
+async function buildGedcom(people, meta, families){
   // Identify root as the person with the minimum indent in the parsed tree
   let rootIdx=-1; let minIndent=Number.POSITIVE_INFINITY;
   for(let i=0;i<people.length;i++){ const ind=Number(people[i].indent||0); if(ind<minIndent){ minIndent=ind; rootIdx=i; } }
@@ -1635,7 +1640,19 @@ function buildGedcom(people, meta, families){
   const head=[ '0 HEAD','1 SOUR GedMapper','2 NAME GedMapper GEDmatch Capture','2 VERS 0.1','1 DATE '+`${yyyy}-${mm}-${dd}`,'1 SUBM @SUB1@','1 GEDC','2 VERS 5.5.1','2 FORM LINEAGE-LINKED','1 CHAR UTF-8' ]; if(meta?.kit) head.push('1 _OM_REFERENCE_KIT '+meta.kit);
   const subm=[ '0 @SUB1@ SUBM','1 NAME GEDmatch Importer User' ];
   const indiPtr = (i)=>`@I${i+1}@`; // index based on array order
-  const blocks = people.map((p,i)=>{ const lines=[`0 ${indiPtr(i)} INDI`, `1 NAME ${p.name || 'Unknown'}`, `1 SEX ${p.sex || 'U'}`]; if(p.birth?.date || p.birth?.place){ lines.push('1 BIRT'); if(p.birth.date) lines.push(`2 DATE ${p.birth.date}`); if(p.birth.place) lines.push(`2 PLAC ${p.birth.place}`);} if(p.death?.date || p.death?.place){ lines.push('1 DEAT'); if(p.death.date) lines.push(`2 DATE ${p.death.date}`); if(p.death.place) lines.push(`2 PLAC ${p.death.place}`);} if(p.url) lines.push(`1 _OM_SOURCE_URL ${p.url}`); if(i===rootIdx && (meta?.rootName)){ lines.push(`1 NOTE _OM_NAME_SOURCE gedmatch-csv`); lines.push(`1 NOTE Root name inferred from kit CSV: ${String(meta.rootName).trim()}`); lines.push('1 NOTE Root individual inferred from GEDmatch pedigree'); } if(i===rootIdx && meta?.atdnaTotal){ const val=String(meta.atdnaTotal).trim(); if(val) lines.push(`1 _OM_ATDNA ${val}`); } return { lines, fLinks: [] }; });
+  // Load segments index once
+  let segIndex=null; try{ const store=await chrome.storage.local.get(['gmSegmentsData']); const segs=store.gmSegmentsData?.segments||[]; segIndex=buildSegmentsIndex(segs); } catch(_e){ segIndex=null; }
+  // Build kit -> email map from autosomal CSV
+  let emailByKit=new Map();
+  try{ const all=(await chrome.storage.local.get(['gmAllCsvRecords'])).gmAllCsvRecords||[]; for(const r of all){ if(r?.Kit && r?.Email) emailByKit.set(r.Kit, r.Email); } } catch(_e){}
+
+  const blocks = await Promise.all(people.map(async (p,i)=>{ const lines=[`0 ${indiPtr(i)} INDI`, `1 NAME ${p.name || 'Unknown'}`, `1 SEX ${p.sex || 'U'}`]; if(p.birth?.date || p.birth?.place){ lines.push('1 BIRT'); if(p.birth.date) lines.push(`2 DATE ${p.birth.date}`); if(p.birth.place) lines.push(`2 PLAC ${p.birth.place}`);} if(p.death?.date || p.death?.place){ lines.push('1 DEAT'); if(p.death.date) lines.push(`2 DATE ${p.death.date}`); if(p.death.place) lines.push(`2 PLAC ${p.death.place}`);} if(p.url) lines.push(`1 _OM_SOURCE_URL ${p.url}`); if(i===rootIdx && (meta?.rootName)){ lines.push(`1 NOTE _OM_NAME_SOURCE gedmatch-csv`); lines.push(`1 NOTE Root name inferred from kit CSV: ${String(meta.rootName).trim()}`); lines.push('1 NOTE Root individual inferred from GEDmatch pedigree'); } if(i===rootIdx && meta?.atdnaTotal){ const val=String(meta.atdnaTotal).trim(); if(val) lines.push(`1 _OM_ATDNA ${val}`); } if(i===rootIdx && meta?.kit){ lines.push('1 _OM_DNA_SOURCE'); lines.push(`2 _OM_KIT_ID ${meta.kit}`); lines.push('2 _OM_KIT_SITE GEDMATCH'); const em=emailByKit.get(meta.kit); if(em) lines.push(`2 _OM_SUBMITTER_EMAIL ${em}`); }
+    // Segment data: if this individual's CSV kit is known, append any segments
+    const kitId = (i===rootIdx ? (meta?.kit||'') : '');
+    if(kitId && segIndex && segIndex.has(kitId)){
+      lines.push(...emitSegmentLinesForKit(kitId, segIndex.get(kitId)));
+    }
+    return { lines, fLinks: [] }; }));
   // Families
   const famBlocks=[]; const famPtr=(i)=>`@F${i+1}@`;
   families.forEach((fam, fi)=>{
@@ -1668,7 +1685,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
 
   document.getElementById('clearSession').onclick = async () => { if(!confirm('This will permanently clear the loaded CSV, parsed list, statuses, and pending data. Continue?')) return; await chrome.storage.local.remove(['gmGedmatchSession','gmGedmatchPendingMeta','gmPendingCsvText','gmStatusByKit','gmFocusedKit','gmCapturedByKit','gmLogsByKit']); document.getElementById('rows').innerHTML=''; document.getElementById('currentBox').classList.add('hidden'); updateStats([],'Cleared'); };
 
-  document.getElementById('btnCapture').onclick = async () => { const st=await getState(); const kit=st.focusedKit; if(!kit){ alert('No focused individual. Click Open on a row first.'); return;} try { const pre=await extractPreFromActiveTab(); if(!isPedigreeUrl(pre?.frame||'')){ alert('Not on a GEDmatch pedigree page. Navigate to a /tools/gedcom/pedigree-chart page first.'); return; } const rowsJson=buildIntermediaryRows(pre); const built=buildFamiliesFromRowsV9(rowsJson); const profile=st.session.profiles.find(x=>x.Kit===kit); const gedcom=buildGedcom(built.people,{ kit, rootName: profile?.Name||'', atdnaTotal: profile?.AtdnaTotal||'' }, built.families); await saveCapture(kit,{ rowsJson, gedcom, count: built.people.length, families: built.families.length, capturedAt:new Date().toISOString(), sourceUrl: pre?.frame||profile?.treeUrl||'' }, built.logs); const statusByKit=st.statusByKit; statusByKit[kit]='yellow'; await saveStatusMap(statusByKit); setCurrentBox(profile,'yellow'); refreshStatusDots(st.session.profiles,statusByKit); updateStats(st.session.profiles, `Captured ${built.people.length} people, ${built.families.length} families`);} catch(e){ console.error('Capture failed',e); alert('Capture failed: '+(e?.message||e)); } };
+  document.getElementById('btnCapture').onclick = async () => { const st=await getState(); const kit=st.focusedKit; if(!kit){ alert('No focused individual. Click Open on a row first.'); return;} try { const pre=await extractPreFromActiveTab(); if(!isPedigreeUrl(pre?.frame||'')){ alert('Not on a GEDmatch pedigree page. Navigate to a /tools/gedcom/pedigree-chart page first.'); return; } const rowsJson=buildIntermediaryRows(pre); const built=buildFamiliesFromRowsV9(rowsJson); const profile=st.session.profiles.find(x=>x.Kit===kit); const gedcom=await buildGedcom(built.people,{ kit, rootName: profile?.Name||'', atdnaTotal: profile?.AtdnaTotal||'' }, built.families); await saveCapture(kit,{ rowsJson, gedcom, count: built.people.length, families: built.families.length, capturedAt:new Date().toISOString(), sourceUrl: pre?.frame||profile?.treeUrl||'' }, built.logs); const statusByKit=st.statusByKit; statusByKit[kit]='yellow'; await saveStatusMap(statusByKit); setCurrentBox(profile,'yellow'); refreshStatusDots(st.session.profiles,statusByKit); updateStats(st.session.profiles, `Captured ${built.people.length} people, ${built.families.length} families`);} catch(e){ console.error('Capture failed',e); alert('Capture failed: '+(e?.message||e)); } };
 
   document.getElementById('btnFinalize').onclick = async () => { const st=await getState(); const kit=st.focusedKit; if(!kit) return; const statusByKit=st.statusByKit; statusByKit[kit]='green'; await saveStatusMap(statusByKit); const profile=st.session.profiles.find(x=>x.Kit===kit); setCurrentBox(profile,'green'); refreshStatusDots(st.session.profiles,statusByKit); };
 
@@ -1690,7 +1707,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
         const rowsJson=buildIntermediaryRows(pre);
         const built=buildFamiliesFromRowsV9(rowsJson);
         const profile=session.profiles.find(x=>x.Kit===kit);
-        const gedcom=buildGedcom(built.people,{ kit, rootName: profile?.Name||'', atdnaTotal: profile?.AtdnaTotal||'' }, built.families);
+      const gedcom=await buildGedcom(built.people,{ kit, rootName: profile?.Name||'', atdnaTotal: profile?.AtdnaTotal||'' }, built.families);
         await saveCapture(kit,{ rowsJson, gedcom, count: built.people.length, families: built.families.length, capturedAt:new Date().toISOString(), sourceUrl: t.pedigreeUrl }, built.logs);
         captured++;
         await chrome.tabs.remove(tab.id);
@@ -1712,7 +1729,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
       const preInfo=await extractPreFromActiveTab(); if(!isPedigreeUrl(preInfo?.frame||'')) { await navLog(p.Kit,{ step:'auto-all-skip-non-pedigree', frame:preInfo?.frame||'' }); await chrome.tabs.remove(tab.id); continue; }
       const rowsJson=buildIntermediaryRows(preInfo);
       const built=buildFamiliesFromRowsV9(rowsJson);
-      const gedcom=buildGedcom(built.people,{ kit:p.Kit, rootName: p?.Name||'', atdnaTotal: p?.AtdnaTotal||'' }, built.families);
+      const gedcom=await buildGedcom(built.people,{ kit:p.Kit, rootName: p?.Name||'', atdnaTotal: p?.AtdnaTotal||'' }, built.families);
       await saveCapture(p.Kit,{ rowsJson, gedcom, count: built.people.length, families: built.families.length, capturedAt:new Date().toISOString(), sourceUrl: preInfo?.frame||p.treeUrl }, built.logs);
       completed++;
       await chrome.tabs.remove(tab.id);
@@ -1755,6 +1772,9 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
       const lines=[]; lines.push('0 HEAD','1 GEDC','2 VERS 5.5.1','1 CHAR UTF-8','1 SOUR GEDMATCH-IMPORTER');
       lines.push('0 @SUB1@ SUBM','1 NAME GEDmatch Importer User');
       const idFor=(i)=>`@I${i+1}@`;
+      // Precompute segment index and email map once for floating individuals
+      let floatSegIndex=null; try{ const storeSeg=await chrome.storage.local.get(['gmSegmentsData']); floatSegIndex=buildSegmentsIndex(storeSeg.gmSegmentsData?.segments||[]); } catch(_e){}
+      let emailByKit=new Map(); try{ const all=(await chrome.storage.local.get(['gmAllCsvRecords'])).gmAllCsvRecords||[]; for(const r of all){ if(r?.Kit && r?.Email) emailByKit.set(r.Kit, r.Email); } } catch(_e){}
       pass.forEach((r,i)=>{
         const name=(r.Name||'Unknown'); const sex=r.Sex||'U';
         lines.push(`0 ${idFor(i)} INDI`);
@@ -1762,6 +1782,11 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
         lines.push(`1 SEX ${sex}`);
         const at=String(r.AtdnaTotal||'').trim(); if(at) lines.push(`1 _OM_ATDNA ${at}`);
         if(r.GedLink) { const cl=classifyGedLink(r.GedLink); if(cl.url) lines.push(`1 _OM_SOURCE_URL ${cl.url}`); }
+        if(r.Kit){ lines.push('1 _OM_DNA_SOURCE'); lines.push(`2 _OM_KIT_ID ${r.Kit}`); lines.push('2 _OM_KIT_SITE GEDMATCH'); const em=emailByKit.get(r.Kit); if(em) lines.push(`2 _OM_SUBMITTER_EMAIL ${em}`); }
+        // Segment data for floating individuals
+        if(r.Kit && floatSegIndex && floatSegIndex.has(r.Kit)){
+          lines.push(...emitSegmentLinesForKit(r.Kit, floatSegIndex.get(r.Kit)));
+        }
       });
       lines.push('0 TRLR');
       files.push({ name:'gedmatch-floating-individuals.ged', data: enc.encode(lines.join('\n')) });
@@ -1836,7 +1861,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
     try {
       const pre={ ok:true, html: txt.replace(/\n/g,'<br>'), text: txt, anchors: [] };
       const { people, families, logs }=parseIndividualsFromPreV7(pre);
-      const gedcom=buildGedcom(people, null, families);
+      const gedcom=await buildGedcom(people, null, families);
       const blob=new Blob([gedcom], { type:'text/plain' });
       const url=URL.createObjectURL(blob);
       await chrome.downloads.download({ url, filename:'gedmatch-ascii-parsed.ged', saveAs:true });
