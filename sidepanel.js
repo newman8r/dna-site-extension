@@ -1820,6 +1820,30 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
     if(msg && msg.type==='gm-trees-detected'){ const st=await getState(); const s=st.session; const kit=msg.kit || st.focusedKit; if(!kit) return; const idx=s.profiles.findIndex(p=>p.Kit===kit); if(idx>=0){ s.profiles[idx].__trees=msg.trees||[]; await saveSession(s); setCurrentBox(s.profiles[idx], (await getState()).statusByKit[kit]||'red'); } }
   });
 
+  // Live preview for floating individuals count
+  async function updateFloatingPreview(){
+    const el=document.getElementById('floatingPreview'); if(!el) return;
+    const include=document.getElementById('includeFloatingIndis')?.checked;
+    if(!include){ el.textContent=''; return; }
+    const st=await getState();
+    const captured=st.capturedByKit||{}; const kitsWithTree=new Set(Object.keys(captured));
+    const allRecords=st.allRecords||[];
+    const floating=allRecords.filter(r=>r?.Kit && !kitsWithTree.has(r.Kit));
+    const minAtdna=parseFloat(document.getElementById('minAtdna')?.value||'0')||0;
+    const minLargest=parseFloat(document.getElementById('minLargest')?.value||'0')||0;
+    let count=0; for(const r of floating){
+      const a=parseFloat(String(r.AtdnaTotal).replace(/[^0-9.]/g,''))||0;
+      const l=parseFloat(String(r.LargestCm).replace(/[^0-9.]/g,''))||0;
+      if(a>=minAtdna && l>=minLargest) count++;
+    }
+    el.textContent=`Floating preview: ${count}`;
+  }
+  document.getElementById('includeFloatingIndis')?.addEventListener('change', updateFloatingPreview);
+  document.getElementById('minAtdna')?.addEventListener('input', updateFloatingPreview);
+  document.getElementById('minLargest')?.addEventListener('input', updateFloatingPreview);
+  // Initialize preview once at load
+  updateFloatingPreview();
+
   document.getElementById('openNext').onclick = async () => { const st=await getState(); const s=st.session; if(!s.profiles?.length) return; const i=Math.max(0, Math.min(s.queueIndex||0, s.profiles.length-1)); const p=s.profiles[i]; s.queueIndex=i+1; await saveSession(s); setCurrentBox(p, (await getState()).statusByKit[p.Kit]||'red'); if(p?.treeUrl) { const tab=await chrome.tabs.create({ url:p.treeUrl, active:true }); await navLog(p.Kit,{ step:'opened-kit-url', url:p.treeUrl }); const loaded=await waitForTabComplete(tab.id); await navLog(p.Kit,{ step:'kit-page-complete', loaded }); const res=await autoNavigateToPedigree(tab.id); await navLog(p.Kit,{ step:'auto-navigate', mode:res?.mode||null, trees:(res?.trees||[]).length, nextUrl: res?.nextUrl||null }); if(res?.nextUrl){ try{ await chrome.runtime.sendMessage({ type:'gm-nav-to-url', tabId:tab.id, url:res.nextUrl }); await navLog(p.Kit,{ step:'background-nav', url:res.nextUrl }); }catch(e){ await navLog(p.Kit,{ step:'background-nav-error', error:String(e) }); } } if(res?.trees?.length){ const s2=(await getState()).session; const idx=s2.profiles.findIndex(x=>x.Kit===p.Kit); if(idx>=0){ s2.profiles[idx].__trees=res.trees; await saveSession(s2); setCurrentBox(s2.profiles[idx], (await getState()).statusByKit[p.Kit]||'red'); } } } };
   
   // Auto-navigate helper: when a 'find-gedcoms-by-kit' table is present, pick first tree and open pedigree; otherwise, on individual page, open Pedigree
