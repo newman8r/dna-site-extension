@@ -52,10 +52,19 @@
     </div>
 
     <div class="row">
-      <div class="muted">Optional: Paste ASCII pedigree (from GEDmatch page) and parse locally</div>
-      <textarea id="asciiText" rows="8" style="width:100%; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size:12px;"></textarea>
-      <div class="controls" style="margin-top:6px;">
-        <button id="btnParseAscii" class="btn">Parse ASCII</button>
+      <a href="#" id="advToggle" class="btn-link">Show advanced</a>
+    </div>
+    <div id="advancedPanel" class="hidden">
+      <div class="row">
+        <div class="muted">Optional: Paste ASCII pedigree (from GEDmatch page) and parse locally</div>
+        <textarea id="asciiText" rows="8" style="width:100%; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size:12px;"></textarea>
+        <div class="controls" style="margin-top:6px;">
+          <button id="btnParseAscii" class="btn">Parse ASCII</button>
+        </div>
+      </div>
+      <div class="row controls">
+        <button id="openNext" class="btn">Open Next</button>
+        <button id="exportJson" class="btn">Export JSON</button>
       </div>
     </div>
 
@@ -98,10 +107,8 @@
       </div>
     </div>
     <div class="row controls">
-      <button id="openNext" class="btn">Open Next</button>
       <button id="autoAllCsv" class="btn">Get All (auto)</button>
       <button id="downloadZipAll" class="btn">Download All GEDCOMs (zip)</button>
-      <button id="exportJson" class="btn">Export JSON</button>
     </div>
     <div class="row">
       <label><input type="checkbox" id="includeFloatingIndis" /> add floating individuals</label>

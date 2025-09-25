@@ -1949,4 +1949,15 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
       alert(`Parsed ASCII: ${people.length} people, ${families.length} families`);
     } catch(e){ console.error('Parse ASCII failed', e); alert('Parse ASCII failed: '+(e?.message||e)); }
   };
+  // Advanced panel toggle
+  const advToggle=document.getElementById('advToggle');
+  const advPanel=document.getElementById('advancedPanel');
+  if(advToggle && advPanel){
+    advToggle.addEventListener('click', (e)=>{
+      e.preventDefault();
+      const hidden=advPanel.classList.contains('hidden');
+      if(hidden){ advPanel.classList.remove('hidden'); advToggle.textContent='Hide advanced'; }
+      else { advPanel.classList.add('hidden'); advToggle.textContent='Show advanced'; }
+    });
+  }
 })();
