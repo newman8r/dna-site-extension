@@ -206,7 +206,31 @@ async function extractPreFromActiveTab(){
   if(!ok?.result?.ok) throw new Error(ok?.result?.error||'pre not found');
   return ok.result; }
 
+// Extract the pedigree <pre> from a specific tab, avoiding active tab races
+async function extractPreFromTabId(tabId){
+  if(!tabId) throw new Error('No tabId provided');
+  const frames = await chrome.scripting.executeScript({ target:{tabId, allFrames:true}, func:()=>{ function collectFrom(root){ const rect=root.getBoundingClientRect(); const anchors=Array.from(root.querySelectorAll('a')).map(a=>{ const r=a.getBoundingClientRect(); const font=a.querySelector('font'); const color=(font?.getAttribute('color')||'').toLowerCase(); return { label:(a.textContent||'').trim(), href:a.getAttribute('href')||a.href||'', color, x: Math.round(r.left-rect.left), y: Math.round(r.top-rect.top) }; }); return { html: root.innerHTML, text: root.innerText, anchors }; }
+    const pre=document.querySelector('section.response-items pre')||document.querySelector('pre');
+    if(pre){ const data=collectFrom(pre); return { ok:true, ...data, frame: window.location.href } }
+    const container=document.querySelector('section.response-items')||document.querySelector('.response-items')||document.body;
+    if(container){ const data=collectFrom(container); return { ok:true, ...data, note:'fallback-no-pre', frame: window.location.href } }
+    return { ok:false, error:'pre not found' };
+  }});
+  const ok=frames.find(f=>f?.result?.ok);
+  if(!ok?.result?.ok) throw new Error(ok?.result?.error||'pre not found');
+  return ok.result;
+}
+
 function isPedigreeUrl(u){ try{ const x=new URL(u); return x.hostname==='pro.gedmatch.com' && x.pathname.includes('/tools/gedcom/pedigree-chart'); } catch { return false; } }
+
+function parsePedigreeParams(urlStr){
+  try{ const u=new URL(urlStr); return { id_family: u.searchParams.get('id_family')||'', id_ged: u.searchParams.get('id_ged')||'' }; } catch { return { id_family:'', id_ged:'' }; }
+}
+function samePedigreeTarget(expectedUrl, actualUrl){
+  if(!expectedUrl || !actualUrl) return false;
+  const a=parsePedigreeParams(expectedUrl); const b=parsePedigreeParams(actualUrl);
+  return Boolean(a.id_family) && Boolean(a.id_ged) && a.id_family===b.id_family && a.id_ged===b.id_ged;
+}
 
 function clusterRows(anchors){ const sorted=[...anchors].sort((a,b)=>a.y-b.y); const rows=[]; const ys=[]; for(const a of sorted){ if(!ys.length || Math.abs(a.y-ys[ys.length-1])>14){ ys.push(a.y); rows.push([a]); } else { rows[rows.length-1].push(a); } } return rows; }
 
@@ -1704,14 +1728,29 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
     let captured=0; for(const t of trees){
       try{
         const tab=await chrome.tabs.create({ url:t.pedigreeUrl, active:false });
-        await new Promise(r=>setTimeout(r, 800));
-        const pre=await extractPreFromActiveTab(); // operates on active tab; switch
-        await chrome.tabs.update(tab.id, { active:true });
+        const ok=await waitForTabComplete(tab.id, 20000);
+        if(!ok){ await chrome.tabs.remove(tab.id); continue; }
+        // Verify URL target and extract with retries
+        let attempts=0; let pre=null;
+        while(attempts++<3){
+          try{
+            pre=await extractPreFromTabId(tab.id);
+            if(isPedigreeUrl(pre?.frame||'') && samePedigreeTarget(t.pedigreeUrl, pre.frame)) break;
+          }catch{ /* retry */ }
+          await chrome.tabs.update(tab.id, { url: t.pedigreeUrl });
+          await waitForTabComplete(tab.id, 20000);
+          await new Promise(r=>setTimeout(r, 300));
+        }
+        if(!pre || !isPedigreeUrl(pre?.frame||'') || !samePedigreeTarget(t.pedigreeUrl, pre.frame)){
+          await navLog(kit,{ step:'auto-tree-skip-mismatch', expected:t.pedigreeUrl, actual:pre?.frame||null });
+          await chrome.tabs.remove(tab.id);
+          continue;
+        }
         const rowsJson=buildIntermediaryRows(pre);
         const built=buildFamiliesFromRowsV9(rowsJson);
         const profile=session.profiles.find(x=>x.Kit===kit);
-      const gedcom=await buildGedcom(built.people,{ kit, rootName: profile?.Name||'', atdnaTotal: profile?.AtdnaTotal||'' }, built.families);
-        await saveCapture(kit,{ rowsJson, gedcom, count: built.people.length, families: built.families.length, capturedAt:new Date().toISOString(), sourceUrl: t.pedigreeUrl }, built.logs);
+        const gedcom=await buildGedcom(built.people,{ kit, rootName: profile?.Name||'', atdnaTotal: profile?.AtdnaTotal||'' }, built.families);
+        await saveCapture(kit,{ rowsJson, gedcom, count: built.people.length, families: built.families.length, capturedAt:new Date().toISOString(), sourceUrl: pre?.frame||t.pedigreeUrl }, built.logs);
         captured++;
         await chrome.tabs.remove(tab.id);
       } catch(e){ console.error('Auto capture failed', e); }
@@ -1723,13 +1762,26 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
   document.getElementById('autoAllCsv').onclick = async () => {
     const st=await getState(); const profiles=st.session.profiles||[]; if(!profiles.length){ alert('No profiles loaded.'); return; }
     let completed=0; for(const p of profiles){ try{
-      // open the kit URL and allow our content.js to auto-navigate to pedigree
-      if(!p.treeUrl) continue; const tab=await chrome.tabs.create({ url:p.treeUrl, active:true });
+      if(!p.treeUrl) continue; const tab=await chrome.tabs.create({ url:p.treeUrl, active:false });
       await navLog(p.Kit,{ step:'auto-all-opened', url:p.treeUrl });
       const loaded=await waitForTabComplete(tab.id); await navLog(p.Kit,{ step:'auto-all-tab-complete', loaded });
-      // give the content script time to jump to pedigree
-      await new Promise(r=>setTimeout(r, 800));
-      const preInfo=await extractPreFromActiveTab(); if(!isPedigreeUrl(preInfo?.frame||'')) { await navLog(p.Kit,{ step:'auto-all-skip-non-pedigree', frame:preInfo?.frame||'' }); await chrome.tabs.remove(tab.id); continue; }
+      // Let content.js compute nextUrl if list/individual
+      const nav=await autoNavigateToPedigree(tab.id);
+      if(nav?.nextUrl){ try{ await chrome.runtime.sendMessage({ type:'gm-nav-to-url', tabId:tab.id, url:nav.nextUrl }); await navLog(p.Kit,{ step:'background-nav', url:nav.nextUrl }); } catch(e){ await navLog(p.Kit,{ step:'background-nav-error', error:String(e) }); } }
+      await waitForTabComplete(tab.id);
+      // Retry extract and verify pedigree target
+      let attempts=0; let preInfo=null;
+      while(attempts++<3){
+        try{ preInfo=await extractPreFromTabId(tab.id); } catch { preInfo=null; }
+        const ok=isPedigreeUrl(preInfo?.frame||'');
+        const match = nav?.nextUrl ? samePedigreeTarget(nav.nextUrl, preInfo?.frame||'') : ok;
+        if(ok && match) break;
+        // enforce navigation if mismatch
+        if(nav?.nextUrl){ await chrome.tabs.update(tab.id, { url: nav.nextUrl }); await waitForTabComplete(tab.id); }
+        await new Promise(r=>setTimeout(r, 300));
+      }
+      if(!preInfo || !isPedigreeUrl(preInfo?.frame||'')){ await navLog(p.Kit,{ step:'auto-all-skip-non-pedigree', frame:preInfo?.frame||'' }); await chrome.tabs.remove(tab.id); continue; }
+      if(nav?.nextUrl && !samePedigreeTarget(nav.nextUrl, preInfo.frame)){ await navLog(p.Kit,{ step:'auto-all-mismatch', expected:nav.nextUrl, actual:preInfo.frame }); await chrome.tabs.remove(tab.id); continue; }
       const rowsJson=buildIntermediaryRows(preInfo);
       const built=buildFamiliesFromRowsV9(rowsJson);
       const gedcom=await buildGedcom(built.people,{ kit:p.Kit, rootName: p?.Name||'', atdnaTotal: p?.AtdnaTotal||'' }, built.families);
