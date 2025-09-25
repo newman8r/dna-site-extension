@@ -99,7 +99,7 @@ function resolveGedUrl(s){
 }
 
 async function getState() {
-  const s = await chrome.storage.local.get(['gmGedmatchSession','gmGedmatchPendingMeta','gmPendingCsvText','gmStatusByKit','gmFocusedKit','gmCapturedByKit','gmLogsByKit','gmAllCsvRecords']);
+  const s = await chrome.storage.local.get(['gmGedmatchSession','gmGedmatchPendingMeta','gmPendingCsvText','gmStatusByKit','gmFocusedKit','gmCapturedByKit','gmLogsByKit','gmAllCsvRecords','gmOcn']);
   return {
     session: s.gmGedmatchSession || { profiles: [], queueIndex: 0, bundle: null },
     pendingMeta: s.gmGedmatchPendingMeta || null,
@@ -108,7 +108,8 @@ async function getState() {
     focusedKit: s.gmFocusedKit || null,
     capturedByKit: s.gmCapturedByKit || {},
     logsByKit: s.gmLogsByKit || {},
-    allRecords: s.gmAllCsvRecords || []
+    allRecords: s.gmAllCsvRecords || [],
+    ocn: s.gmOcn || ''
   };
 }
 
@@ -1698,6 +1699,7 @@ async function buildGedcom(people, meta, families){
   } catch(_){ }
   const now=new Date(); const yyyy=now.getFullYear(); const mm=String(now.getMonth()+1).padStart(2,'0'); const dd=String(now.getDate()).padStart(2,'0');
   const head=[ '0 HEAD','1 SOUR GedMapper','2 NAME GedMapper GEDmatch Capture','2 VERS 0.1','1 DATE '+`${yyyy}-${mm}-${dd}`,'1 SUBM @SUB1@','1 GEDC','2 VERS 5.5.1','2 FORM LINEAGE-LINKED','1 CHAR UTF-8' ]; if(meta?.kit) head.push('1 _OM_REFERENCE_KIT '+meta.kit);
+  try { const ocnStore = await chrome.storage.local.get(['gmOcn']); const ocnVal=(ocnStore?.gmOcn||'').trim(); if(ocnVal){ head.push('1 _OM_OCN '+ocnVal); } } catch(_e) {}
   const subm=[ '0 @SUB1@ SUBM','1 NAME GEDmatch Importer User' ];
   const indiPtr = (i)=>`@I${i+1}@`; // index based on array order
   // Load segments index once
@@ -1891,11 +1893,13 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
     dv3.setUint32(0,0x06054b50,true); dv3.setUint16(4,0,true); dv3.setUint16(6,0,true); dv3.setUint16(8,files.length,true); dv3.setUint16(10,files.length,true); dv3.setUint32(12,centralSize,true); dv3.setUint32(16,offset,true); dv3.setUint16(20,0,true);
     const blob=new Blob([...parts, ...centrals, eocd], { type:'application/zip' });
     const url=URL.createObjectURL(blob);
-    // Build filename: <ReferenceKit>_gmp_<M-D-YYYY>.zip
+    // Build filename: {OCN}_{ReferenceKit}_gmp_{M-D-YYYY}.zip
     let refKit=''; try{ refKit=String(store?.gmGedmatchSession?.bundle?.source?.referenceKit||'').trim(); }catch(_e){}
+    let ocn=''; try{ ocn=String((await getState()).ocn||'').trim(); }catch(_e){}
     const d=new Date(); const m=d.getMonth()+1; const day=d.getDate(); const yyyy=d.getFullYear();
     const dateStr=`${m}-${day}-${yyyy}`;
-    const prefix=refKit?`${refKit}_`:'';
+    const partsPrefix=[ocn||null, refKit||null].filter(Boolean).join('_');
+    const prefix = partsPrefix ? `${partsPrefix}_` : '';
     const filename=`${prefix}gmp_${dateStr}.zip`;
     await chrome.downloads.download({ url, filename, saveAs:true }); setTimeout(()=>URL.revokeObjectURL(url), 10000);
   };
@@ -1998,5 +2002,11 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
       if(hidden){ advPanel.classList.remove('hidden'); advToggle.textContent='Hide advanced'; }
       else { advPanel.classList.add('hidden'); advToggle.textContent='Show advanced'; }
     });
+  }
+  // OCN input persist
+  const ocnInput=document.getElementById('ocnInput');
+  if(ocnInput){
+    ocnInput.value = (await getState()).ocn || '';
+    ocnInput.addEventListener('input', async ()=>{ await chrome.storage.local.set({ gmOcn: ocnInput.value.trim() }); });
   }
 })();
