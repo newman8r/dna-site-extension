@@ -42,6 +42,35 @@ function toRecords(header, body) {
   }));
 }
 
+// Extract top-of-file metadata like Reference Kit and Date Exported from the first few rows
+function extractTopMeta(rows){
+  const out={ referenceKit:null, dateExported:null };
+  const MAX_SCAN=Math.min(rows.length, 10);
+  for(let ri=0; ri<MAX_SCAN; ri++){
+    const row=rows[ri]||[];
+    for(let ci=0; ci<row.length; ci++){
+      const cell=String(row[ci]||'').trim(); if(!cell) continue;
+      // Reference Kit
+      if(/\breference\s*kit\b/i.test(cell)){
+        const next=String(row[ci+1]||'').trim();
+        if(next){ out.referenceKit = next; }
+        else {
+          const m=cell.match(/reference\s*kit\s*[:\-]?\s*(\S+)/i); if(m&&m[1]) out.referenceKit=m[1];
+        }
+      }
+      // Date Exported
+      if(/\bdate\s*exported\b/i.test(cell)){
+        const next=String(row[ci+1]||'').trim();
+        if(next){ out.dateExported = next; }
+        else {
+          const m=cell.match(/date\s*exported\s*[:\-]?\s*(.+)$/i); if(m&&m[1]) out.dateExported=m[1].trim();
+        }
+      }
+    }
+  }
+  return out;
+}
+
 function classifyGedLink(s) {
   const out={ type:'none', url:'', raw: s||'' };
   if(!s) return out; const t=String(s).trim(); if(!t || t==='null') return out;
@@ -181,11 +210,15 @@ function emitSegmentLinesForKit(kit, segList){ const lines=[]; if(!kit||!Array.i
 
 function buildSessionFromText(text) {
   const rows = parseCsv(text);
+  const topMeta = extractTopMeta(rows);
   const { header, body } = normalizeHeaderRow(rows);
   if (header.length === 0) return { error: 'Invalid CSV: header not found' };
   const recs = toRecords(header, body).map(r => { const cl=classifyGedLink(r.GedLink); return { ...r, treeUrl: cl.type==='gedmatch'?cl.url:'', treeType: cl.type, rawTreeLink: cl.raw }; });
   const profiles = recs.filter(r => r.treeType==='gedmatch');
-  return { session: { profiles, queueIndex: 0, bundle: { exportedAt: new Date().toISOString(), source: { site: 'GEDmatch' }, profiles, captures: [] } }, allRecords: recs };
+  const source={ site:'GEDmatch' };
+  if(topMeta.referenceKit) source.referenceKit=topMeta.referenceKit;
+  if(topMeta.dateExported) source.dateExported=topMeta.dateExported;
+  return { session: { profiles, queueIndex: 0, bundle: { exportedAt: new Date().toISOString(), source, profiles, captures: [] } }, allRecords: recs };
 }
 
 const MONTHS = { jan:'JAN', feb:'FEB', mar:'MAR', apr:'APR', may:'MAY', jun:'JUN', jul:'JUL', aug:'AUG', sep:'SEP', sept:'SEP', oct:'OCT', nov:'NOV', dec:'DEC' };
@@ -1857,7 +1890,13 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
     const centralSize=centrals.reduce((a,b)=>a+b.length,0); const eocd=new Uint8Array(22); const dv3=new DataView(eocd.buffer);
     dv3.setUint32(0,0x06054b50,true); dv3.setUint16(4,0,true); dv3.setUint16(6,0,true); dv3.setUint16(8,files.length,true); dv3.setUint16(10,files.length,true); dv3.setUint32(12,centralSize,true); dv3.setUint32(16,offset,true); dv3.setUint16(20,0,true);
     const blob=new Blob([...parts, ...centrals, eocd], { type:'application/zip' });
-    const url=URL.createObjectURL(blob); const filename=`gedmatch-captures-${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.zip`;
+    const url=URL.createObjectURL(blob);
+    // Build filename: <ReferenceKit>_gmp_<M-D-YYYY>.zip
+    let refKit=''; try{ refKit=String(store?.gmGedmatchSession?.bundle?.source?.referenceKit||'').trim(); }catch(_e){}
+    const d=new Date(); const m=d.getMonth()+1; const day=d.getDate(); const yyyy=d.getFullYear();
+    const dateStr=`${m}-${day}-${yyyy}`;
+    const prefix=refKit?`${refKit}_`:'';
+    const filename=`${prefix}gmp_${dateStr}.zip`;
     await chrome.downloads.download({ url, filename, saveAs:true }); setTimeout(()=>URL.revokeObjectURL(url), 10000);
   };
 
