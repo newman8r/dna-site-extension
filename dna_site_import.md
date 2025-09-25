@@ -1,6 +1,6 @@
 # DNA Site Import — GEDmatch Browser Extension (Phase 1)
 
-Last updated: 2025-09-14
+Last updated: 2025-09-25
 
 This document specifies a Chrome/Chromium browser extension and backend integration to ingest GEDmatch One‑to‑Many CSVs, semi‑manually capture pedigree trees from linked pages (ASCII pedigree views), stitch sub‑trees, enrich identities via Enformion, export a normalized JSON bundle, and load results into ATLAS for overlap detection and merge planning. The design intentionally leaves room to add other sources later (WikiTree, FamilyTreeDNA, etc.).
 
@@ -8,14 +8,14 @@ This document specifies a Chrome/Chromium browser extension and backend integrat
 
 ## Goals
 
-- Import GEDmatch one‑to‑many CSV exports and normalize rows into profile records.
+- Ingest GEDmatch one‑to‑many CSV and optional one‑to‑one segments CSV; normalize rows into profile records.
 - Drive a guided capture flow that helps the user open each match’s pedigree page and “Capture Tree” at the right time, with an additional “Capture Subtree” for deeper ancestral branches.
 - Merge overlapping captures coming from the same person across multiple pages (shared anchor individual).
 - Produce a single JSON bundle containing: CSV metadata, profiles, per‑profile captures, subtrees, and cross‑references to source URLs.
 - Integrate with ATLAS: upload/import JSON bundles; detect cross‑file overlap; plan safe merges.
 - Enrich select identities by correlating emails/usernames with Enformion to infer probable real names for triangulation.
 
-Out of scope (Phase 1): automated navigation past internal site pages; direct WikiTree scrape; background workers; ATLAS per‑name index/search.
+Out of scope (Phase 1): fully autonomous crawling beyond pedigree pages; direct WikiTree scrape; background workers; ATLAS per‑name index/search.
 
 ---
 
@@ -35,19 +35,27 @@ CSV ingestion must:
 - Store `Source` and `Overlap` as hints only; do not rely on them for identity.
 - Emit consistent `profiles[]` with stable UUIDs.
 
+### Optional: GEDmatch One‑to‑One Segments CSV
+
+- Expected columns (observed across exports; case/spacing varies): `PrimaryKit, MatchedKit, Chr, B37 Start, B37 End, Segment cM, SNPs, MatchedName, Matched Sex, MatchedEmail`.
+- Used for two purposes:
+  - Embed per‑kit segment metadata into GEDCOM under `_OM_SEGMENT_DATA` for the root kit individual.
+  - Filter and enrich “floating individuals” (matches without captured trees) when generating a standalone GEDCOM of floating INDIs.
+
 ---
 
 ## Extension Architecture (Chrome MV3)
 
-- Manifest V3 with `action` popup and optional `sidePanel` for compact workflow.
+- Manifest V3 with Side Panel as the primary UI; a minimal action popup/import page exists for legacy/prototyping.
 - Components:
-  - Background service worker: job queue, per‑tab state, capture coordination.
-  - Popup UI: CSV upload, profile list, progress, next/prev controls, export.
-  - Content script (domain‑scoped): injects a small floating toolbar with buttons: “Capture Tree” and “Capture Subtree”; extracts page context when clicked.
-  - Options page: feature flags, domain settings, Enformion API key (optional per‑user).
+  - Background service worker: lightweight session state and message hooks.
+  - Side Panel UI: CSV upload, segments upload, queue, capture controls, auto modes, ZIP/JSON export.
+  - Content script (domain‑scoped): basic auto‑navigation to pedigree pages and a placeholder toolbar; capture is triggered from the Side Panel.
+  - Options page: planned for future (feature flags, domain settings, Enformion key).
 
 Permissions:
-- `activeTab`, `scripting`, `storage`, `downloads`, host permissions for `https://www.gedmatch.com/*` (and staging/alt hosts), optional future hosts.
+- `activeTab`, `tabs`, `scripting`, `storage`, `downloads`, `unlimitedStorage`, `sidePanel`.
+- Host permissions: `https://pro.gedmatch.com/*` and `https://*.gedmatch.com/*`.
 
 State storage:
 - `chrome.storage.local` for working sessions.
@@ -57,20 +65,18 @@ State storage:
 
 ## User Flow
 
-1) Upload CSV in the popup.
-2) Extension parses rows into `profiles[]`. Filter to those with a `GED WikiTree` link.
-3) For each profile, the user clicks “Open Next” in popup:
-   - Background opens a new tab (or focuses existing) to the profile’s `GED WikiTree` URL.
-   - The user navigates as needed to reach the ASCII pedigree page.
-4) On the pedigree page, user clicks the in‑page floating “Capture Tree” button:
-   - Content script extracts the `<pre>` ASCII chart plus metadata (page URL, visible person anchor if determinable).
-   - The capture is saved to `captures[]` under the active profile.
-5) If the page exposes ancestor expansion links (e.g., “more ancestors”/segment pages), the user may follow one and click “Capture Subtree”. The content script:
-   - Extracts the subtree ASCII block and attempts to identify the overlap person with the prior capture (anchor individual).
-   - Records `subtree { overlap: <anchorName/anchorHref>, ascii, url }`.
-6) Repeat for more profiles.
-7) Export: Popup bundles CSV metadata + profiles + captures + subtrees into a single JSON file.
-8) Import in backend ATLAS: create an “External Trees” library entry and run overlap detection and merge planning.
+1) Open the Side Panel and upload the GEDmatch one‑to‑many CSV.
+2) Optionally upload the one‑to‑one segments CSV and click “Parse Segments CSV”.
+3) Click “Parse CSV”. The extension parses rows into `profiles[]` and filters to those with GEDmatch tree links.
+4) For each profile, click “Open Next” (or click a specific Open button). The content script auto‑navigates from list/individual pages to the pedigree chart.
+   - Alternatively, use “Get All (auto)” for the focused kit or “Get All (auto) across CSV” to iterate kits end‑to‑end.
+5) On the pedigree chart, click “Capture Tree” (in the Side Panel). The panel extracts the `<pre>` ASCII chart via `chrome.scripting`, builds families (V9), and stores the capture for the kit.
+6) Use “Get All Trees (auto)” to capture every pedigree detected for the focused kit (when a list page enumerates multiple individuals/trees).
+7) When done, download outputs:
+   - Per‑kit GEDCOM via “Download GEDCOM”, or all kits via “Download All GEDCOMs (zip)”.
+   - Optional “floating individuals” GEDCOM: include matches with no captured tree, filtered by cM thresholds, with DNA/kit metadata.
+   - JSON session export is also available.
+8) Import the GEDCOMs or JSON into ATLAS to analyze overlaps and plan merges.
 
 ---
 
@@ -248,13 +254,14 @@ interface EnformionHit {
 
 ---
 
-## Content Script — Extraction Logic
+## Content Script — Navigation & Signals; Extraction via Side Panel
 
-- Detect page readiness; on GEDmatch list pages (`/tools/gedcom/find-gedcoms-by-kit`) collect all internal GEDmatch tree links, compute their pedigree URLs, message the side panel with the set, and auto-navigate to the first pedigree.
-- On an “individual” page (`/tools/gedcom/individual`) compute the pedigree URL from `id_family` and `id_ged` and navigate.
-- On the pedigree chart: locate the `<pre>` element, extract `innerHTML` and `innerText`, then parse nodes + edges as described above.
-- WikiTree links are ignored for now (Phase 2 will add WikiTree capture support).
-- Return a capture payload via `chrome.runtime.sendMessage`. For “Capture Subtree”, repeat the process and include overlap anchor.
+- Auto‑navigation:
+  - On GEDmatch list pages (`/tools/gedcom/find-gedcoms-by-kit`), collect internal links, compute pedigree URLs, emit `gm-trees-detected`, and navigate to the first pedigree.
+  - On an “individual” page (`/tools/gedcom/individual`), compute the pedigree URL from `id_family`/`id_ged` and navigate.
+- Extraction is triggered from the Side Panel. The panel uses `chrome.scripting.executeScript` against the active tab to extract the `<pre>` block (`innerHTML`, `innerText`, anchor metadata), then builds rows JSON and families (V9) in‑panel.
+- WikiTree and other external links are ignored for now (planned in Phase 2).
+- “Capture Subtree” UI exists as a stub; subtree capture/merge is planned in a subsequent phase.
 
 Performance: the `<pre>` block is small; parsing runs in milliseconds.
 
@@ -279,10 +286,10 @@ Performance: the `<pre>` block is small; parsing runs in milliseconds.
 
 ## Export & Import
 
-- Export: single `.json` bundle via the popup. Filename suggestion: `gedmatch-import-<referenceKit>-<yyyyMMdd-HHmm>.json`.
-- The bundle contains full CSV metadata, all profiles, captures, and subtrees.
+- ZIP export: Side Panel can download all captured per‑kit GEDCOMs as a single ZIP. Filenames: `gedmatch-capture-<KIT>.ged`. When enabled, a `gedmatch-floating-individuals.ged` is added containing matches without captured trees.
+- JSON export: a single `.json` bundle of the current session is also available. Filename suggestion: `gedmatch-import-<referenceKit>-<yyyyMMdd-HHmm>.json`.
 - Import to backend:
-  - New ATLAS importer endpoint: `POST /atlas/external/gedmatch` accepting the JSON bundle.
+  - ATLAS importer endpoint (Phase 1): `POST /atlas/external/gedmatch` accepting the JSON bundle or GEDCOM files.
   - Backend validates schema, stores bundle metadata, and schedules overlap analysis.
 
 ---
@@ -442,6 +449,26 @@ Rules:
   - `1 NOTE Root name inferred from kit CSV: <Name>`
   - `_OM_ATDNA` as a level‑1 custom tag: `1 _OM_ATDNA <Total cM - Autosomal>` when present in the CSV row.
 
+#### DNA Source block and Segment data
+- For the root individual (the CSV kit) we include a DNA source block:
+  - `1 _OM_DNA_SOURCE`
+  - `2 _OM_KIT_ID <Kit>`
+  - `2 _OM_KIT_SITE GEDMATCH`
+  - `2 _OM_SUBMITTER_EMAIL <Email>` when available from CSV
+- When a Segments CSV is loaded, we embed per‑row segment metadata for the root kit as repeated blocks:
+  - `1 _OM_SEGMENT_DATA`
+  - `2 _OM_PRIMARY_KIT <primary>`
+  - `2 _OM_MATCHED_KIT <matched>`
+  - `2 _OM_CHROMOSOME <chr>`
+  - `2 _OM_BUILD B37`
+  - `2 _OM_SEGMENT_START <b37Start>`
+  - `2 _OM_SEGMENT_END <b37End>`
+  - `2 _OM_SEGMENT_CM <cM>`
+  - `2 _OM_KIT_SOURCE GEDMATCH`
+
+#### Floating individuals GEDCOM
+- When exporting floating individuals, we emit minimal `INDI` records (no `FAM`) for matches without captured trees, including `1 NAME`, `1 SEX`, `_OM_ATDNA`, `_OM_DNA_SOURCE`, and any available `_OM_SEGMENT_DATA` entries referencing the kit.
+
 ### Pointer Allocation
 
 - Deterministic allocation within each export: assign pointers in breadth‑first order from the anchor (subject) to ancestors.
@@ -496,16 +523,17 @@ Rules:
 
 ## Chrome Extension (Unpacked) — Quickstart
 
-Folder: `gedmatch-extension/`
+Folder contents (root):
 
 - `manifest.json` — MV3 manifest
-- `popup.html` / `popup.js` — CSV upload, parsing, listing, open-next, JSON export
-- `background.js` — session state and message hooks
-- `content.js` — placeholder toolbar injection (will add capture next)
+- `sidepanel.html` / `sidepanel.js` — primary UI (CSV/segments upload, capture, auto, ZIP/JSON export)
+- `background.js` — session wiring and message hooks
+- `content.js` — auto‑navigation and placeholder toolbar
+- `popup.html` / `popup.js`, `import.html` / `import.js` — legacy/minimal UIs
 - `README.md` — load instructions
 
 Load steps:
 1. Chrome → `chrome://extensions/` → enable Developer mode
-2. Load unpacked → select `gedmatch-extension`
-3. Click the extension icon → upload CSV → Parse → iterate rows with links
-4. Use Export JSON to save the current session bundle
+2. Load unpacked → select the project folder
+3. Click the extension icon to open the Side Panel → upload CSV (and optional Segments CSV) → Parse → capture trees (or auto‑capture)
+4. Download ZIP (with optional floating individuals) and/or export JSON

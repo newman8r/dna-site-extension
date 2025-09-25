@@ -464,8 +464,8 @@ function buildIntermediaryRows(result){
   const text=(result.text||'').replace(/\u00a0/g,' ');
   const lines=text.split(/\r?\n/);
   let anchors=[];
-  if(Array.isArray(result.anchors)&&result.anchors.length){ anchors=result.anchors.map(a=>({ label:(a.label||'').trim(), href:a.href||'', color:(a.color||'').toLowerCase(), x: typeof a.x==='number'?a.x:null, y: typeof a.y==='number'?a.y:null })); }
-  else { const container=document.createElement('div'); container.innerHTML=result.html||''; anchors=Array.from(container.querySelectorAll('a')).map(a=>{ const font=a.querySelector('font'); return { label:(a.textContent||'').trim(), href:a.getAttribute('href')||'', color:(font?.getAttribute('color')||'').toLowerCase(), x:null, y:null }; }); }
+  if(Array.isArray(result.anchors)&&result.anchors.length){ anchors=result.anchors.map(a=>{ const raw=(a.label||''); const label=(raw||'').trim(); const labelNorm=label.replace(/\u00a0/g,' '); return { label, labelNorm, href:a.href||'', color:(a.color||'').toLowerCase(), x: typeof a.x==='number'?a.x:null, y: typeof a.y==='number'?a.y:null }; }); }
+  else { const container=document.createElement('div'); container.innerHTML=result.html||''; anchors=Array.from(container.querySelectorAll('a')).map(a=>{ const font=a.querySelector('font'); const raw=(a.textContent||''); const label=(raw||'').trim(); const labelNorm=label.replace(/\u00a0/g,' '); return { label, labelNorm, href:a.getAttribute('href')||'', color:(font?.getAttribute('color')||'').toLowerCase(), x:null, y:null }; }); }
 
   function pairOutermost(lefts, rights){ const segs=[]; let li=0; let ri=rights.length-1; while(li<lefts.length && ri>=0){ const l=lefts[li]; while(ri>=0 && rights[ri]<=l) ri--; if(ri<0) break; const r=rights[ri--]; if(r>l) segs.push({ L:l, R:r, mid: Math.floor((l+r)/2) }); li++; } return segs; }
 
@@ -481,23 +481,26 @@ function buildIntermediaryRows(result){
     const persons=[]; const controls=[]; {
       const matchIdxs=[];
       for(let ai=0; ai<anchors.length; ai++){
-        const a=anchors[ai]; if(!a.label) continue; if(s.indexOf(a.label)!==-1) matchIdxs.push(ai);
+        const a=anchors[ai]; const lbl=(a.labelNorm||a.label||''); if(!lbl) continue; if(s.indexOf(lbl)!==-1) matchIdxs.push(ai);
       }
       // pick the first unused matching anchor (there should be exactly one person per line)
       const chosenIdx=matchIdxs.find(ai=>!usedAnchor[ai]);
       if(chosenIdx!=null){
         const a=anchors[chosenIdx]; usedAnchor[chosenIdx]=true;
-        const idx=s.indexOf(a.label);
-        // detect navigation/expand anchors (e.g., '=>', '>>', arrows) — labels with no letters
-        const isControl = !/[A-Za-z]/.test(a.label);
+        const lbl=(a.labelNorm||a.label||'');
+        let idx=s.indexOf(lbl);
+        // detect navigation/expand anchors (e.g., '=>', '>>', arrows) — labels with no letters (Unicode-aware)
+        const hasLetters=/\p{L}/u.test(lbl);
+        const isControl = !hasLetters;
         if(isControl){
           controls.push({ kind:'expand', col: idx, label: a.label, href: resolveGedUrl(a.href||'') });
         } else {
-          const parsed=parsePersonLabel(a.label);
+          const parsed=parsePersonLabel(lbl);
+          if(idx===-1){ const nameOnly=(parsed?.name||'').trim(); if(nameOnly){ idx=s.indexOf(nameOnly); } }
           const sex=a.color==='red'?'F':a.color==='blue'?'M':'U';
           const url=resolveGedUrl(a.href||'');
           const indentRaw=idx; const px=a.x;
-          const rec={ label:a.label, name:parsed.name, birth:parsed.birth, death:parsed.death, sex, url, col:idx, indentRaw, px, indent:null, leadingSpaces:(s.match(/^\s*/)||[''])[0].length };
+          const rec={ label:lbl, name:parsed.name, birth:parsed.birth, death:parsed.death, sex, url, col:idx, indentRaw, px, indent:null, leadingSpaces:(s.match(/^\s*/)||[''])[0].length };
           persons.push(rec); personRefs.push({ line:i, ref:rec });
         }
       }
