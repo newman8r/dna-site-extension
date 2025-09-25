@@ -16,9 +16,7 @@ This version uses Chrome’s Side Panel for a persistent UI while you browse and
 
 - Select the GEDmatch CSV in the side panel
 - Click "Parse CSV" to load rows with GED links
-- Use "Open" or "Open Next" to navigate to tree pages
-- Use "Export JSON" to download the session bundle
-
-## Notes
-
-- Popups cannot be forced to stay open during file chooser; Side Panel is the recommended Chrome pattern.
+- Optionally select a CSV from the 1-to-1 segment dats, and click "parse csv"
+- Click 'get all' (auto) to download all available trees
+- Check the 'floating individuals' box to export individuals who did not have a tree, and filter them by cM match values
+- Click 'Download all Gedcoms (zip)' which will save all trees into a zip file 
