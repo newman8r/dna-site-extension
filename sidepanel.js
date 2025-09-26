@@ -2287,7 +2287,17 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
           setTimeout(()=>URL.revokeObjectURL(url), 10000);
         }catch(e){ alert('Download failed: '+String(e?.message||e)); }
       };
+      const btnDel=document.createElement('button'); btnDel.className='btn btn-link'; btnDel.title='Delete'; btnDel.textContent='🗑️';
+      btnDel.onclick=async ()=>{
+        try{
+          const store=await chrome.storage.local.get(['gmReportsFiles']);
+          const arr=Array.isArray(store.gmReportsFiles)?store.gmReportsFiles:[];
+          const idx=arr.findIndex(x=>x && x.name===f.name && x.savedAt===f.savedAt && x.sourceUrl===f.sourceUrl);
+          if(idx>=0){ arr.splice(idx,1); await chrome.storage.local.set({ gmReportsFiles: arr }); renderReportsFiles(arr); refreshReportStatus(); }
+        }catch(e){ alert('Delete failed: '+String(e?.message||e)); }
+      };
       item.appendChild(name); item.appendChild(document.createTextNode(' ')); item.appendChild(btn);
+      item.appendChild(document.createTextNode(' ')); item.appendChild(btnDel);
       el.appendChild(item);
     }
   }
@@ -2309,7 +2319,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
     }catch(_e){ el.textContent='(no logs)'; }
   }
   // Render any saved files on load
-  try{ const store=await chrome.storage.local.get(['gmReportsFiles']); renderReportsFiles(store.gmReportsFiles||[]); } catch(_e){}
+  try{ const store=await chrome.storage.local.get(['gmReportsFiles']); renderReportsFiles(store.gmReportsFiles||[]); refreshReportStatus(); } catch(_e){}
   // Render logs now and refresh periodically while Reports tab is visible
   renderReportsLog();
   setInterval(()=>{
@@ -2435,5 +2445,23 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
       try{ await new Promise((resolve)=>{ chrome.debugger.detach({ tabId }, ()=>resolve()); }); }catch(_e){}
       return false;
     }
+  }
+
+  function setReportStatus(which, ok){
+    const id = which==='one' ? 'statusOneToMany' : 'statusSegments';
+    const el=document.getElementById(id); if(!el) return;
+    const dot=el.querySelector('.dot'); if(!dot) return;
+    dot.classList.remove('red','yellow','green');
+    dot.classList.add(ok ? 'green' : 'red');
+  }
+  async function refreshReportStatus(){
+    try{
+      const store=await chrome.storage.local.get(['gmReportsFiles']);
+      const files=Array.isArray(store.gmReportsFiles)?store.gmReportsFiles:[];
+      const hasOne = files.some(f=>/one-to-many/i.test(f.name||''));
+      const hasSeg = files.some(f=>/segment/i.test(f.name||'') || /match/i.test(f.name||''));
+      setReportStatus('one', hasOne);
+      setReportStatus('seg', hasSeg);
+    }catch(_e){}
   }
 })();
