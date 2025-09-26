@@ -16,6 +16,8 @@
     "downloads",
     "unlimitedStorage",
     "tabs",
+    "webNavigation",
+    "debugger",
     "sidePanel"
   ],
   "host_permissions": [

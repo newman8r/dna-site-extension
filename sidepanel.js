@@ -2009,4 +2009,431 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
     ocnInput.value = (await getState()).ocn || '';
     ocnInput.addEventListener('input', async ()=>{ await chrome.storage.local.set({ gmOcn: ocnInput.value.trim() }); });
   }
+
+  // Tabs (Capture / Reports)
+  const tabMainBtn=document.getElementById('tabMainBtn');
+  const tabReportsBtn=document.getElementById('tabReportsBtn');
+  const panelMain=document.getElementById('panelMain');
+  const panelReports=document.getElementById('panelReports');
+  function showPanel(which){ if(which==='reports'){ panelReports.classList.remove('hidden'); panelMain.classList.add('hidden'); tabReportsBtn.classList.add('btn-primary'); tabMainBtn.classList.remove('btn-primary'); } else { panelMain.classList.remove('hidden'); panelReports.classList.add('hidden'); tabMainBtn.classList.add('btn-primary'); tabReportsBtn.classList.remove('btn-primary'); } }
+  if(tabMainBtn&&tabReportsBtn&&panelMain&&panelReports){ tabMainBtn.onclick=()=>showPanel('main'); tabReportsBtn.onclick=()=>showPanel('reports'); }
+
+  // Reports: One-to-Many automation
+  const btnRun=document.getElementById('btnRunOneToMany');
+  const kitInput=document.getElementById('oneToManyKit');
+  if(btnRun&&kitInput){
+    btnRun.onclick = async () => {
+      const kit=(kitInput.value||'').trim(); if(!kit){ alert('Enter a Kit ID first.'); return; }
+      console.log('[Reports] Starting automation for kit:', kit);
+      const url=`https://pro.gedmatch.com/tools/one-to-many-segment-based?kit_num=${encodeURIComponent(kit)}`;
+      try{ await navLog(kit,{ area:'reports', step:'open-one-to-many', url }); }catch(_e){}
+      const tab=await chrome.tabs.create({ url, active: true });
+      await waitForTabComplete(tab.id, 30000);
+      console.log('[Reports] Page loaded, clicking Search button');
+      // Auto-click the Search button on the form
+      try{
+        await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
+          const btn=document.querySelector('button#edit-submit.js-form-submit');
+          if(btn){ btn.click(); return { clicked:true }; }
+          // Drupal often injects submit input too
+          const alt=document.querySelector('input#edit-submit[type="submit"]');
+          if(alt){ alt.click(); return { clicked:true, alt:true }; }
+          return { clicked:false };
+        }});
+          try{ await navLog(kit,{ area:'reports', step:'one-to-many-search-clicked' }); }catch(_e){}
+          renderReportsLog();
+      }catch(e){ console.warn('Auto-click failed', e); }
+      await waitForTabComplete(tab.id, 30000);
+      // Click Download CSV button to generate the link
+      try{
+        await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
+          const dl=document.querySelector('button#edit-download-csv.js-form-submit');
+          if(dl){ dl.click(); return { clicked:true }; }
+          const alt=document.querySelector('input#edit-download-csv[type="submit"]');
+          if(alt){ alt.click(); return { clicked:true, alt:true }; }
+          return { clicked:false };
+        }});
+        try{ await navLog(kit,{ area:'reports', step:'one-to-many-download-clicked' }); }catch(_e){}
+        renderReportsLog();
+      } catch(e){ console.warn('Download button click failed', e); }
+      await waitForTabComplete(tab.id, 30000);
+      // Find the generated link by text and fetch the CSV
+      try{
+        const execRes = await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
+          const a=[...document.querySelectorAll('a')].find(x=> (x.textContent||'').trim()==='Click here to download file.');
+          if(!a) return { ok:false };
+          const href=a.getAttribute('href')||a.href||'';
+          const url = href && /^https?:/i.test(href) ? href : (href ? (new URL(href, location.origin)).toString() : '');
+          return { ok:Boolean(url), url, filename: (href||'').split('/').pop()||'' };
+        }});
+        const linkInfo = (execRes && execRes[0] && execRes[0].result) || null;
+        try{ await navLog(kit,{ area:'reports', step:'one-to-many-link', ok: !!(linkInfo&&linkInfo.ok), url: linkInfo?.url||null, filename: linkInfo?.filename||null }); }catch(_e){}
+        if(linkInfo?.ok && linkInfo.url){
+          // Fetch the CSV in the extension context
+          const resp = await fetch(linkInfo.url, { credentials:'include' });
+          const blob = await resp.blob();
+          const buf = await blob.arrayBuffer();
+          const bytes = new Uint8Array(buf);
+          const fileRec = { name: linkInfo.filename || `one-to-many-${Date.now()}.csv`, data: Array.from(bytes), savedAt: new Date().toISOString(), sourceUrl: linkInfo.url };
+          const store = await chrome.storage.local.get(['gmReportsFiles']);
+          const files = Array.isArray(store.gmReportsFiles) ? store.gmReportsFiles : [];
+          files.unshift(fileRec);
+          await chrome.storage.local.set({ gmReportsFiles: files });
+          renderReportsFiles(files);
+          try{ await navLog(kit,{ area:'reports', step:'one-to-many-fetched', bytes: bytes.length }); }catch(_e){}
+          renderReportsLog();
+          // Proceed to segment match flow: select all and open Visualization Options
+          try{
+            await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
+              const selAll=document.querySelector('input.form-checkbox[title="Select all rows in this table"]');
+              if(selAll){
+                if(!selAll.checked){ selAll.click(); selAll.checked=true; }
+                selAll.dispatchEvent(new Event('change', { bubbles:true }));
+                return { selected:true };
+              }
+              return { selected:false };
+            }});
+            try{ await navLog(kit,{ area:'reports', step:'select-all', selected:true }); }catch(_e){}
+            renderReportsLog();
+          }catch(e){ console.warn('Select-all failed', e); }
+          try{
+            await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
+              const vis=document.querySelector('#edit-multi-kit-analysis-submit');
+              if(vis){ vis.click(); return { clicked:true }; }
+              return { clicked:false };
+            }});
+            try{ await navLog(kit,{ area:'reports', step:'vis-options-click' }); }catch(_e){}
+            renderReportsLog();
+            console.log('[Reports] Visualization Options clicked');
+          }catch(e){ console.warn('Visualization Options click failed', e); }
+          await waitForTabComplete(tab.id, 30000);
+          // On the visualization page, click the Search button to run the segment report
+          try{
+            // Ask background to watch for child tab opened from this tab
+            try{ await new Promise(res=>chrome.runtime.sendMessage({ type:'gm:watchChildTabs', parentTabId: tab.id }, ()=>res())); }catch(_e){}
+            let clicked=false; let tries=0;
+            while(!clicked && tries++<5){
+              const exec = await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
+                const b1=document.querySelector('button#edit-submit--2.button.js-form-submit');
+                const b2=document.querySelector('button#edit-submit.button.js-form-submit');
+                const b3=document.querySelector('button[data-drupal-selector="edit-submit"].js-form-submit');
+                const btn=b1||b2||b3;
+                if(btn){ btn.click(); return { clicked:true }; }
+                const i1=document.querySelector('input#edit-submit--2[type="submit"]');
+                const i2=document.querySelector('input#edit-submit[type="submit"]');
+                const i3=document.querySelector('input[data-drupal-selector="edit-submit"][type="submit"]');
+                const alt=i1||i2||i3; if(alt){ alt.click(); return { clicked:true, alt:true }; }
+                return { clicked:false };
+              }});
+              clicked = !!(exec && exec[0] && exec[0].result && exec[0].result.clicked);
+              if(!clicked){ await new Promise(r=>setTimeout(r, 500)); }
+            }
+            try{ await navLog(kit,{ area:'reports', step:'segment-search-clicked' }); }catch(_e){}
+            renderReportsLog();
+            console.log('[Reports] Segment search clicked, waiting for results...');
+          }catch(e){ console.warn('Segment Search click failed', e); }
+          await waitForTabComplete(tab.id, 30000);
+          // Immediately adopt results tab if background stored it, and close the parent wrong tab
+          try{
+            const s=await chrome.storage.local.get(['gmSegmentResultsTabId']);
+            if(s.gmSegmentResultsTabId && s.gmSegmentResultsTabId!==tab.id){
+              console.log('[Reports] Adopting detected results tab:', s.gmSegmentResultsTabId, 'closing parent:', tab.id);
+              try{ await chrome.tabs.remove(tab.id); }catch(_e){}
+              tab.id = s.gmSegmentResultsTabId;
+            }
+          }catch(_e){}
+          // Prefer the currently active GEDmatch tab again after the search
+          try{ const activeId2=await getActiveGedmatchTabId(tab.id); if(activeId2!==tab.id){ console.log('[Reports] Using active GEDmatch tab after search:', activeId2); tab.id=activeId2; } }catch(_e){}
+          // Generate segment CSV link: NEW APPROACH - diagnose then act
+          console.log('[Reports] Diagnosing segment page...');
+          await new Promise(r=>setTimeout(r, 3000)); // Let AJAX settle
+          
+          try{
+            // Step 1: Diagnose what's on the page
+            const diagnosis = await chrome.scripting.executeScript({ 
+              target:{ tabId: tab.id }, 
+              func:()=>{
+                const btn = document.querySelector('#edit-download-csv');
+                const allButtons = [...document.querySelectorAll('button, input[type="submit"]')].map(b=>({
+                  id: b.id,
+                  text: b.textContent?.trim() || b.value,
+                  type: b.type,
+                  name: b.name
+                }));
+                
+                // Check if button exists and its properties
+                if(!btn) return { 
+                  buttonFound: false, 
+                  allButtons,
+                  pageHasDownloadText: document.body.textContent.includes('Download CSV')
+                };
+                
+                // Get computed styles to check visibility
+                const styles = window.getComputedStyle(btn);
+                const rect = btn.getBoundingClientRect();
+                
+                return {
+                  buttonFound: true,
+                  id: btn.id,
+                  name: btn.name,
+                  value: btn.value,
+                  type: btn.type,
+                  disabled: btn.disabled,
+                  visible: styles.display !== 'none' && styles.visibility !== 'hidden',
+                  inViewport: rect.top >= 0 && rect.bottom <= window.innerHeight,
+                  hasForm: !!btn.form,
+                  formAction: btn.form?.action,
+                  allButtons
+                };
+              }
+            });
+            
+            console.log('[Reports] Page diagnosis:', diagnosis[0]?.result);
+            
+            if(!diagnosis[0]?.result?.buttonFound){
+              console.error('[Reports] Download CSV button not found!');
+              console.log('[Reports] Buttons on page:', diagnosis[0]?.result?.allButtons);
+              return;
+            }
+            
+            // Step 2: Try the simplest approach - just submit the form with the button value
+            console.log('[Reports] Attempting form submission with button value...');
+            // New: perform POST in page context and parse response for CSV link (handle HTML or Drupal AJAX JSON)
+            try{
+              const submitInfoArr = await chrome.scripting.executeScript({ target:{ tabId: tab.id }, func: async ()=>{
+                try{
+                  const btn=document.querySelector('#edit-download-csv, [data-drupal-selector="edit-download-csv"]');
+                  const form=btn?.form || btn?.closest('form');
+                  if(!form) return { ok:false, error:'no-form' };
+                  const fd=new FormData(form);
+                  fd.set(btn.name||'op', btn.value||'Download CSV');
+                  const action=form.action||location.href;
+                  const resp=await fetch(action, { method:'POST', body: fd, credentials:'include' });
+                  const text=await resp.text();
+                  let link='';
+                  // Try Drupal AJAX JSON
+                  try{
+                    const json=JSON.parse(text);
+                    if(Array.isArray(json)){
+                      for(const cmd of json){
+                        const command=(cmd?.command||'').toLowerCase();
+                        if(command==='insert'){
+                          const html = cmd?.data?.markup || cmd?.data || '';
+                          if(typeof html==='string'){
+                            const m = html.match(/href\s*=\s*"([^"]+\.csv[^"]*)"/i);
+                            if(m){ link = new URL(m[1], location.origin).toString(); break; }
+                          }
+                        }
+                      }
+                    }
+                  }catch(_e){}
+                  // Fallback: parse as full HTML
+                  if(!link){
+                    try{
+                      const doc=new DOMParser().parseFromString(text, 'text/html');
+                      const a1=[...doc.querySelectorAll('a')].find(a=>(a.textContent||'').trim()==='Click here to download file.');
+                      const a2=a1 || [...doc.querySelectorAll('a[href]')].find(a=>/\.csv(\?|$)/i.test(a.getAttribute('href')||a.href||''));
+                      if(a2){ const href=a2.getAttribute('href')||a2.href||''; link = href && /^https?:/i.test(href) ? href : (href ? (new URL(href, location.origin).toString()) : ''); }
+                    }catch(_e){}
+                  }
+                  return { ok:Boolean(link), link, action, submitted:true };
+                }catch(e){ return { ok:false, error:String(e) }; }
+              }});
+              const submitInfo = submitInfoArr && submitInfoArr[0] && submitInfoArr[0].result;
+              if(submitInfo?.ok && submitInfo.link){
+                console.log('[Reports] Extracted segment link from POST response:', submitInfo.link);
+                const resp = await fetch(submitInfo.link, { credentials:'include' });
+                const blob = await resp.blob();
+                const buf = await blob.arrayBuffer();
+                const bytes = new Uint8Array(buf);
+                const name = submitInfo.link.split('/').pop() || `segments-${Date.now()}.csv`;
+                const store = await chrome.storage.local.get(['gmReportsFiles']);
+                const files = Array.isArray(store.gmReportsFiles) ? store.gmReportsFiles : [];
+                files.unshift({ name, data: Array.from(bytes), savedAt: new Date().toISOString(), sourceUrl: submitInfo.link });
+                await chrome.storage.local.set({ gmReportsFiles: files });
+                renderReportsFiles(files);
+                try{ await navLog(kit,{ area:'reports', step:'segments-fetched', filename:name, bytes: bytes.length }); }catch(_e){}
+                renderReportsLog();
+                return; // Done
+              }
+            }catch(e){ console.warn('POST-parse extraction failed', e); }
+          }catch(e){ 
+            console.error('[Reports] Segment download failed:', e); 
+            await navLog(kit,{ area:'reports', step:'segment-download-error', error:String(e) });
+          }
+          // Allow AJAX to finish rendering link (no full navigation)
+          await new Promise(r=>setTimeout(r, 2000));
+        } else {
+          alert('Download link not found.');
+        }
+      } catch(e){ console.error('Fetch CSV failed', e); alert('Failed to fetch CSV: '+String(e?.message||e)); }
+    };
+  }
+
+  function renderReportsFiles(files){
+    const el=document.getElementById('reportsFiles'); if(!el) return;
+    el.innerHTML='';
+    const list=Array.isArray(files)?files:[];
+    for(const f of list){
+      const item=document.createElement('div');
+      const name=document.createElement('span'); name.textContent=f.name||'report.csv'; name.className='muted';
+      const btn=document.createElement('button'); btn.className='btn btn-link'; btn.textContent='Download';
+      btn.onclick=async ()=>{
+        try{
+          const bytes=new Uint8Array(f.data||[]);
+          const blob=new Blob([bytes], { type:'text/csv' });
+          const url=URL.createObjectURL(blob);
+          await chrome.downloads.download({ url, filename:f.name||'report.csv', saveAs:true });
+          setTimeout(()=>URL.revokeObjectURL(url), 10000);
+        }catch(e){ alert('Download failed: '+String(e?.message||e)); }
+      };
+      item.appendChild(name); item.appendChild(document.createTextNode(' ')); item.appendChild(btn);
+      el.appendChild(item);
+    }
+  }
+  async function renderReportsLog(){
+    const el=document.getElementById('reportsLog'); if(!el) return;
+    try{
+      const store=await chrome.storage.local.get(['gmLogsByKit','gmFocusedKit']);
+      let kit=store.gmFocusedKit||null; const logs=store.gmLogsByKit||{};
+      if(!kit){
+        // Fallback: use current one-to-many kit input
+        try{ const k=document.getElementById('oneToManyKit')?.value?.trim(); if(k) kit=k; }catch(_e){}
+      }
+      const arr=kit? (logs[kit]||[]) : [];
+      const reportLogs=arr.filter(x=>x?.area==='reports');
+      el.textContent = reportLogs.map(l=>{
+        const t=l.t||new Date().toISOString(); const step=l.step||''; const extra=JSON.stringify(Object.fromEntries(Object.entries(l).filter(([k])=>!['t','area','step'].includes(k))));
+        return `${t}  ${step}  ${extra}`;
+      }).join('\n');
+    }catch(_e){ el.textContent='(no logs)'; }
+  }
+  // Render any saved files on load
+  try{ const store=await chrome.storage.local.get(['gmReportsFiles']); renderReportsFiles(store.gmReportsFiles||[]); } catch(_e){}
+  // Render logs now and refresh periodically while Reports tab is visible
+  renderReportsLog();
+  setInterval(()=>{
+    const panel=document.getElementById('panelReports');
+    if(panel && !panel.classList.contains('hidden')){ renderReportsLog(); }
+  }, 1500);
+
+  // Resolve the actual results tab after a form submission that may open a new tab
+  async function resolveSegmentResultsTab(originalTabId){
+    const deadline=Date.now()+15000;
+    let lastCheckedTabId=originalTabId;
+    while(Date.now()<deadline){
+      try{
+        // First, check the original tab for the expected controls
+        const res = await chrome.scripting.executeScript({ target:{ tabId: originalTabId }, func:()=>{
+          const hasSegmentControls = !!document.querySelector('#edit-download-csv') || !!document.querySelector('input[type="submit"][value="Match CSV file"]') || !!document.querySelector('input[type="submit"][value*="Segment CSV"]');
+          return { ok: hasSegmentControls, href: location.href };
+        }});
+        if(res && res[0] && res[0].result && res[0].result.ok){ return originalTabId; }
+      }catch(_e){}
+      try{
+        // Next, check the active tab in the last-focused browser window (not the side panel)
+        let active = null;
+        try{ const win=await chrome.windows.getLastFocused({ populate:true }); if(win && Array.isArray(win.tabs)){ active = win.tabs.find(t=>t.active) || null; } }catch(_e){}
+        if(!active){ const activeArr = await chrome.tabs.query({ active:true, lastFocusedWindow:true }); active = activeArr && activeArr[0]; }
+        if(active && active.id!==lastCheckedTabId && /gedmatch\.com/i.test(active.url||'')){
+          const ra = await chrome.scripting.executeScript({ target:{ tabId: active.id }, func:()=>{
+            const hasSegmentControls = !!document.querySelector('#edit-download-csv') || !!document.querySelector('input[type="submit"][value="Match CSV file"]') || !!document.querySelector('input[type="submit"][value*="Segment CSV"]');
+            return { ok: hasSegmentControls, href: location.href };
+          }});
+          if(ra && ra[0] && ra[0].result && ra[0].result.ok){ return active.id; }
+          lastCheckedTabId = active.id;
+        }
+      }catch(_e){}
+      try{
+        // Finally, scan all tabs that belong to gedmatch and check quickly
+        const tabs = await chrome.tabs.query({});
+        const candidates = tabs.filter(t=>/gedmatch\.com/i.test(t.url||''));
+        for(const t of candidates){
+          const rr = await chrome.scripting.executeScript({ target:{ tabId: t.id }, func:()=>{
+            const hasSegmentControls = !!document.querySelector('#edit-download-csv') || !!document.querySelector('input[type="submit"][value="Match CSV file"]') || !!document.querySelector('input[type="submit"][value*="Segment CSV"]');
+            return { ok: hasSegmentControls, href: location.href };
+          }});
+          if(rr && rr[0] && rr[0].result && rr[0].result.ok){ return t.id; }
+        }
+      }catch(_e){}
+      await new Promise(r=>setTimeout(r, 500));
+    }
+    return originalTabId;
+  }
+
+  // Always prefer the currently focused GEDmatch tab after navigations
+  async function getActiveGedmatchTabId(fallbackId){
+    try{
+      const win=await chrome.windows.getLastFocused({ populate:true });
+      if(win && Array.isArray(win.tabs)){
+        const t = win.tabs.find(tb=>tb.active && /gedmatch\.com/i.test(tb.url||''));
+        if(t) return t.id;
+      }
+    }catch(_e){}
+    try{
+      const arr=await chrome.tabs.query({ active:true, lastFocusedWindow:true });
+      const t=arr && arr.find(tb=>/gedmatch\.com/i.test(tb.url||''));
+      if(t) return t.id;
+    }catch(_e){}
+    try{
+      const arr=await chrome.tabs.query({ active:true });
+      const t=arr && arr.find(tb=>/gedmatch\.com/i.test(tb.url||''));
+      if(t) return t.id;
+    }catch(_e){}
+    return fallbackId;
+  }
+
+  async function findSegmentResultsTabId(){
+    try{ const s=await chrome.storage.local.get(['gmSegmentResultsTabId']); if(s.gmSegmentResultsTabId) return s.gmSegmentResultsTabId; }catch(_e){}
+    try{ const tabs=await chrome.tabs.query({ url: 'https://pro.gedmatch.com/tools/multi-kit-analysis/segment-search*' }); if(Array.isArray(tabs)&&tabs.length){ const active=tabs.find(t=>t.active); return (active||tabs[0]).id; } }catch(_e){}
+    try{ const tabs=await chrome.tabs.query({}); const c=tabs.filter(t=>/pro\.gedmatch\.com\/tools\/multi-kit-analysis\/segment-search/i.test(t.url||'')); if(c.length){ const active=c.find(t=>t.active); return (active||c[0]).id; } }catch(_e){}
+    try{ const tabs=await chrome.tabs.query({ url: 'https://pro.gedmatch.com/*' }); for(const t of tabs){ try{ const res=await chrome.scripting.executeScript({ target:{ tabId: t.id }, func:()=>{ const has = document.querySelector('#edit-download-csv') || document.querySelector('input[type="submit"][value="Match CSV file"]') || document.querySelector('input[type="submit"][value*="Segment CSV"]'); return !!has; } }); if(res && res[0] && res[0].result){ return t.id; } }catch(_e){} } }catch(_e){}
+    return null;
+  }
+
+  // Perform a physical click using DevTools Protocol (requires debugger permission)
+  async function physicalClickViaDebugger(tabId, selector){
+    try{
+      // Focus the window/tab to ensure events land
+      try{ const t=await chrome.tabs.get(tabId); if(t?.windowId){ await chrome.windows.update(t.windowId, { focused:true }); } await chrome.tabs.update(tabId, { active:true }); }catch(_e){}
+      // Compute coordinates of target element
+      const posRes = await chrome.scripting.executeScript({ target:{ tabId }, func:(sel)=>{
+        const el = document.querySelector(sel);
+        if(!el) return { ok:false };
+        try{ el.scrollIntoView({ block:'center' }); }catch(_e){}
+        const r = el.getBoundingClientRect();
+        const x = Math.floor(r.left + (r.width/2));
+        const y = Math.floor(r.top + (r.height/2));
+        return { ok:true, x, y };
+      }, args:[selector] });
+      const pos = posRes && posRes[0] && posRes[0].result;
+      if(!pos?.ok) return false;
+
+      // Attach debugger
+      await new Promise((resolve, reject)=>{
+        chrome.debugger.attach({ tabId }, '1.3', ()=>{
+          if(chrome.runtime.lastError){ reject(new Error(chrome.runtime.lastError.message)); return; }
+          resolve();
+        });
+      });
+
+      const send = (method, params)=>new Promise((resolve,reject)=>{
+        chrome.debugger.sendCommand({ tabId }, method, params, (res)=>{
+          if(chrome.runtime.lastError){ reject(new Error(chrome.runtime.lastError.message)); return; }
+          resolve(res);
+        });
+      });
+
+      await send('Input.dispatchMouseEvent', { type:'mouseMoved', x: pos.x, y: pos.y, button:'none' });
+      await send('Input.dispatchMouseEvent', { type:'mousePressed', x: pos.x, y: pos.y, button:'left', clickCount: 1 });
+      await send('Input.dispatchMouseEvent', { type:'mouseReleased', x: pos.x, y: pos.y, button:'left', clickCount: 1 });
+
+      // Detach debugger
+      try{ await new Promise((resolve)=>{ chrome.debugger.detach({ tabId }, ()=>resolve()); }); }catch(_e){}
+      return true;
+    }catch(e){
+      try{ await new Promise((resolve)=>{ chrome.debugger.detach({ tabId }, ()=>resolve()); }); }catch(_e){}
+      return false;
+    }
+  }
 })();
