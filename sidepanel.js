@@ -1882,12 +1882,16 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
       files.push({ name:'gedmatch-floating-individuals.ged', data: enc.encode(lines.join('\n')) });
     }
     function dosDateTime(dt){ const d=dt||new Date(); const time=(d.getHours()<<11)|(d.getMinutes()<<5)|((d.getSeconds()/2)|0); const date=((d.getFullYear()-1980)<<9)|((d.getMonth()+1)<<5)|d.getDate(); return {time,date}; }
+    // CRC32 helper (store method requires CRC in headers)
+    const CRC32_TABLE=(function(){ const t=new Uint32Array(256); for(let n=0;n<256;n++){ let c=n; for(let k=0;k<8;k++){ c=(c&1)?(0xEDB88320^(c>>>1)):(c>>>1);} t[n]=c>>>0; } return t; })();
+    function crc32Of(bytes){ let crc=0^0xFFFFFFFF; for(let i=0;i<bytes.length;i++){ crc=CRC32_TABLE[(crc^bytes[i])&0xFF]^(crc>>>8);} return (crc^0xFFFFFFFF)>>>0; }
     const parts=[]; const centrals=[]; let offset=0; for(const f of files){ const {time,date}=dosDateTime(new Date()); const nameBytes=enc.encode(f.name);
+      const crc=crc32Of(f.data);
       const lh=new Uint8Array(30+nameBytes.length); const dv=new DataView(lh.buffer);
-      dv.setUint32(0,0x04034b50,true); dv.setUint16(4,20,true); dv.setUint16(6,0,true); dv.setUint16(8,0,true); dv.setUint16(10,time,true); dv.setUint16(12,date,true); dv.setUint32(14,0,true); dv.setUint32(18,f.data.length,true); dv.setUint32(22,f.data.length,true); dv.setUint16(26,nameBytes.length,true); dv.setUint16(28,0,true); lh.set(nameBytes,30);
+      dv.setUint32(0,0x04034b50,true); dv.setUint16(4,20,true); dv.setUint16(6,0,true); dv.setUint16(8,0,true); dv.setUint16(10,time,true); dv.setUint16(12,date,true); dv.setUint32(14,crc,true); dv.setUint32(18,f.data.length,true); dv.setUint32(22,f.data.length,true); dv.setUint16(26,nameBytes.length,true); dv.setUint16(28,0,true); lh.set(nameBytes,30);
       parts.push(lh, f.data);
       const ch=new Uint8Array(46+nameBytes.length); const dv2=new DataView(ch.buffer);
-      dv2.setUint32(0,0x02014b50,true); dv2.setUint16(4,20,true); dv2.setUint16(6,20,true); dv2.setUint16(8,0,true); dv2.setUint16(10,0,true); dv2.setUint16(12,time,true); dv2.setUint16(14,date,true); dv2.setUint32(16,0,true); dv2.setUint32(20,f.data.length,true); dv2.setUint32(24,f.data.length,true); dv2.setUint16(28,nameBytes.length,true); dv2.setUint16(30,0,true); dv2.setUint16(32,0,true); dv2.setUint16(34,0,true); dv2.setUint16(36,0,true); dv2.setUint32(38,0,true); dv2.setUint32(42,offset,true); ch.set(nameBytes,46);
+      dv2.setUint32(0,0x02014b50,true); dv2.setUint16(4,20,true); dv2.setUint16(6,20,true); dv2.setUint16(8,0,true); dv2.setUint16(10,0,true); dv2.setUint16(12,time,true); dv2.setUint16(14,date,true); dv2.setUint32(16,crc,true); dv2.setUint32(20,f.data.length,true); dv2.setUint32(24,f.data.length,true); dv2.setUint16(28,nameBytes.length,true); dv2.setUint16(30,0,true); dv2.setUint16(32,0,true); dv2.setUint16(34,0,true); dv2.setUint16(36,0,true); dv2.setUint32(38,0,true); dv2.setUint32(42,offset,true); ch.set(nameBytes,46);
       centrals.push(ch); offset += lh.length + f.data.length; }
     const centralSize=centrals.reduce((a,b)=>a+b.length,0); const eocd=new Uint8Array(22); const dv3=new DataView(eocd.buffer);
     dv3.setUint32(0,0x06054b50,true); dv3.setUint16(4,0,true); dv3.setUint16(6,0,true); dv3.setUint16(8,files.length,true); dv3.setUint16(10,files.length,true); dv3.setUint32(12,centralSize,true); dv3.setUint32(16,offset,true); dv3.setUint16(20,0,true);
@@ -2018,6 +2022,17 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
   function showPanel(which){ if(which==='reports'){ panelReports.classList.remove('hidden'); panelMain.classList.add('hidden'); tabReportsBtn.classList.add('btn-primary'); tabMainBtn.classList.remove('btn-primary'); } else { panelMain.classList.remove('hidden'); panelReports.classList.add('hidden'); tabMainBtn.classList.add('btn-primary'); tabReportsBtn.classList.remove('btn-primary'); } }
   if(tabMainBtn&&tabReportsBtn&&panelMain&&panelReports){ tabMainBtn.onclick=()=>showPanel('main'); tabReportsBtn.onclick=()=>showPanel('reports'); }
 
+  // Reports OCN input mirrors main OCN storage
+  (async ()=>{
+    try{
+      const el=document.getElementById('ocnInputReports');
+      if(!el) return;
+      const s=await chrome.storage.local.get(['gmOcn']);
+      el.value=(s?.gmOcn||'');
+      el.addEventListener('input', async ()=>{ await chrome.storage.local.set({ gmOcn: el.value.trim() }); });
+    }catch(_e){}
+  })();
+
   // Reports: One-to-Many automation
   const btnRun=document.getElementById('btnRunOneToMany');
   const kitInput=document.getElementById('oneToManyKit');
@@ -2074,12 +2089,14 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
           const blob = await resp.blob();
           const buf = await blob.arrayBuffer();
           const bytes = new Uint8Array(buf);
-          const fileRec = { name: linkInfo.filename || `one-to-many-${Date.now()}.csv`, data: Array.from(bytes), savedAt: new Date().toISOString(), sourceUrl: linkInfo.url };
+          const fileRec = { name: linkInfo.filename || `one-to-many-${Date.now()}.csv`, data: Array.from(bytes), savedAt: new Date().toISOString(), sourceUrl: linkInfo.url, kind: 'one-to-many' };
           const store = await chrome.storage.local.get(['gmReportsFiles']);
           const files = Array.isArray(store.gmReportsFiles) ? store.gmReportsFiles : [];
           files.unshift(fileRec);
           await chrome.storage.local.set({ gmReportsFiles: files });
           renderReportsFiles(files);
+          await refreshReportStatus();
+          await updateBundleUi();
           try{ await navLog(kit,{ area:'reports', step:'one-to-many-fetched', bytes: bytes.length }); }catch(_e){}
           renderReportsLog();
           // Proceed to segment match flow: select all and open Visualization Options
@@ -2249,9 +2266,16 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
                 const name = submitInfo.link.split('/').pop() || `segments-${Date.now()}.csv`;
                 const store = await chrome.storage.local.get(['gmReportsFiles']);
                 const files = Array.isArray(store.gmReportsFiles) ? store.gmReportsFiles : [];
-                files.unshift({ name, data: Array.from(bytes), savedAt: new Date().toISOString(), sourceUrl: submitInfo.link });
+                files.unshift({ name, data: Array.from(bytes), savedAt: new Date().toISOString(), sourceUrl: submitInfo.link, kind: 'segments' });
                 await chrome.storage.local.set({ gmReportsFiles: files });
                 renderReportsFiles(files);
+                await refreshReportStatus();
+                await updateBundleUi();
+                // Auto-run Auto-Kinship now that segments CSV is saved
+                try{
+                  const kitVal=(document.getElementById('oneToManyKit')?.value||'').trim();
+                  if(kitVal){ runAutoKinshipFlow(kitVal).catch(()=>{}); }
+                }catch(_e){}
                 try{ await navLog(kit,{ area:'reports', step:'segments-fetched', filename:name, bytes: bytes.length }); }catch(_e){}
                 renderReportsLog();
                 return; // Done
@@ -2276,12 +2300,18 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
     const list=Array.isArray(files)?files:[];
     for(const f of list){
       const item=document.createElement('div');
-      const name=document.createElement('span'); name.textContent=f.name||'report.csv'; name.className='muted';
+      const name=document.createElement('span'); name.textContent=f.name||'report'; name.className='muted';
       const btn=document.createElement('button'); btn.className='btn btn-link'; btn.textContent='Download';
       btn.onclick=async ()=>{
         try{
+          if(f.url){
+            // Remote URL (e.g., S3 pre-signed)
+            await chrome.downloads.download({ url: f.url, filename: f.name||'report.zip', saveAs:true });
+            return;
+          }
           const bytes=new Uint8Array(f.data||[]);
-          const blob=new Blob([bytes], { type:'text/csv' });
+          const mime=f.mime||(/\.zip$/i.test(f.name||'')?'application/zip':'text/csv');
+          const blob=new Blob([bytes], { type: mime });
           const url=URL.createObjectURL(blob);
           await chrome.downloads.download({ url, filename:f.name||'report.csv', saveAs:true });
           setTimeout(()=>URL.revokeObjectURL(url), 10000);
@@ -2319,12 +2349,12 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
     }catch(_e){ el.textContent='(no logs)'; }
   }
   // Render any saved files on load
-  try{ const store=await chrome.storage.local.get(['gmReportsFiles']); renderReportsFiles(store.gmReportsFiles||[]); refreshReportStatus(); } catch(_e){}
+  try{ const store=await chrome.storage.local.get(['gmReportsFiles']); renderReportsFiles(store.gmReportsFiles||[]); refreshReportStatus(); updateBundleUi(); } catch(_e){}
   // Render logs now and refresh periodically while Reports tab is visible
   renderReportsLog();
   setInterval(()=>{
     const panel=document.getElementById('panelReports');
-    if(panel && !panel.classList.contains('hidden')){ renderReportsLog(); }
+    if(panel && !panel.classList.contains('hidden')){ renderReportsLog(); updateBundleUi(); }
   }, 1500);
 
   // Resolve the actual results tab after a form submission that may open a new tab
@@ -2448,7 +2478,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
   }
 
   function setReportStatus(which, ok){
-    const id = which==='one' ? 'statusOneToMany' : 'statusSegments';
+    const id = which==='one' ? 'statusOneToMany' : which==='seg' ? 'statusSegments' : 'statusAutoKinship';
     const el=document.getElementById(id); if(!el) return;
     const dot=el.querySelector('.dot'); if(!dot) return;
     dot.classList.remove('red','yellow','green');
@@ -2458,10 +2488,199 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
     try{
       const store=await chrome.storage.local.get(['gmReportsFiles']);
       const files=Array.isArray(store.gmReportsFiles)?store.gmReportsFiles:[];
-      const hasOne = files.some(f=>/one-to-many/i.test(f.name||''));
-      const hasSeg = files.some(f=>/segment/i.test(f.name||'') || /match/i.test(f.name||''));
+      const classify = (f)=>{
+        if(f?.kind==='one-to-many') return 'one';
+        if(f?.kind==='segments') return 'seg';
+        if(f?.kind==='autokinship') return 'ak';
+        const name=(f?.name||'').toLowerCase();
+        if(/one-to-many/.test(name)) return 'one';
+        if(/segment|match/.test(name)) return 'seg';
+        if(/autokinship|\.zip$/.test(name)) return 'ak';
+        // Heuristic: peek header
+        try{
+          const bytes=new Uint8Array(f?.data||[]);
+          const text=new TextDecoder('utf-8').decode(bytes.slice(0, 2048));
+          if(/\bKit\b,\s*Name\b.*GED WikiTree/i.test(text)) return 'one';
+          if(/\bPrimaryKit\b|\bMatchedKit\b|\bSegment cM\b/i.test(text)) return 'seg';
+        }catch(_e){}
+        return null;
+      };
+      let hasOne=false, hasSeg=false, hasAk=false;
+      for(const f of files){ const k=classify(f); if(k==='one') hasOne=true; else if(k==='seg') hasSeg=true; else if(k==='ak') hasAk=true; }
       setReportStatus('one', hasOne);
       setReportStatus('seg', hasSeg);
+      setReportStatus('ak', hasAk);
+      // Enable Auto-Kinship if both are present
+      try{ const btn=document.getElementById('btnRunAutoKinship'); if(btn){ btn.disabled = !(hasOne && hasSeg); } }catch(_e){}
+    }catch(_e){}
+  }
+  // Auto-Kinship flow shared function
+  async function runAutoKinshipFlow(kit){
+    if(!kit) return;
+    // Gate on both CSVs present
+    try{
+      const store=await chrome.storage.local.get(['gmReportsFiles']);
+      const files=Array.isArray(store.gmReportsFiles)?store.gmReportsFiles:[];
+      const hasOne=files.some(f=>f?.kind==='one-to-many' || /one-to-many/i.test(f?.name||''));
+      const hasSeg=files.some(f=>f?.kind==='segments' || /segment|match/i.test(f?.name||''));
+      if(!(hasOne && hasSeg)) return;
+      // Skip if we already have autokinship
+      const hasAk=files.some(f=>f?.kind==='autokinship' || /autokinship|\.zip$/i.test(f?.name||''));
+      if(hasAk) return;
+    }catch(_e){}
+    try{ await navLog(kit,{ area:'reports', step:'open-auto-kinship' }); }catch(_e){}
+    const url='https://pro.gedmatch.com/tools/auto-kinship';
+    const tab=await chrome.tabs.create({ url, active:true });
+    await waitForTabComplete(tab.id, 30000);
+    // Fill kit and submit
+    try{
+      await chrome.scripting.executeScript({ target:{ tabId: tab.id }, func:(K)=>{
+        const input=document.querySelector('[data-drupal-selector="edit-kit1"]')||document.getElementById('edit-kit1');
+        if(input){ input.focus(); input.value=K; input.dispatchEvent(new Event('input',{bubbles:true})); }
+        const btn=document.querySelector('[data-drupal-selector="edit-submit"]')||document.getElementById('edit-submit');
+        if(btn){ btn.click(); return { ok:true, clicked:true }; }
+        // Fallback submit
+        const form=input?.form || document.querySelector('form[action*="auto-kinship"]');
+        if(form){ form.requestSubmit?.(); form.submit?.(); return { ok:true, submitted:true }; }
+        return { ok:false };
+      }, args:[kit] });
+      try{ await navLog(kit,{ area:'reports', step:'auto-kinship-submitted' }); }catch(_e){}
+    }catch(e){ console.warn('Auto-Kinship submit failed', e); }
+    // Wait a while for next page to load
+    await waitForTabComplete(tab.id, 60000);
+    // Poll for the Download Results link (can take up to ~1 minute)
+    try{ await navLog(kit,{ area:'reports', step:'auto-kinship-waiting' }); }catch(_e){}
+    const deadline = Date.now() + 120000;
+    let linkUrl = null;
+    while(Date.now() < deadline){
+      try{
+        const res = await chrome.scripting.executeScript({ target:{ tabId: tab.id }, func:()=>{
+          const as=[...document.querySelectorAll('a[href]')];
+          // Prefer anchors that directly point to .zip
+          const zip = as.map(a=>a.getAttribute('href')||a.href||'').find(h=>/\.zip(\?|$)/i.test(h||''));
+          if(zip){
+            const url = /^https?:/i.test(zip) ? zip : (new URL(zip, location.origin)).toString();
+            return { ok:true, url };
+          }
+          // As a fallback, if a Download Results link exists but not a .zip yet, do not return it; keep waiting
+          return { ok:false };
+        }});
+        const info = res && res[0] && res[0].result;
+        if(info && info.ok && info.url){ linkUrl = info.url; break; }
+      }catch(_e){}
+      // Nudge the page by clicking the visible Download Results button if present
+      try{
+        await chrome.scripting.executeScript({ target:{ tabId: tab.id }, func:()=>{
+          const btn=[...document.querySelectorAll('a,button')].find(el=>/download results/i.test((el.textContent||'').trim()));
+          if(btn){ try{ btn.click(); }catch(_){} }
+        }});
+      }catch(_e){}
+      await new Promise(r=>setTimeout(r, 2500));
+    }
+    if(linkUrl){
+      try{ await navLog(kit,{ area:'reports', step:'auto-kinship-link-found', url: linkUrl }); }catch(_e){}
+      // Verify the resolved URL actually points to a ZIP; if not, attempt to resolve from in-page AJAX/HTML response
+      try{
+        const head = await fetch(linkUrl, { method:'HEAD' });
+        const ctype = head.headers.get('content-type')||'';
+        if(!/zip/i.test(ctype) && !/\.zip(\?|$)/i.test(linkUrl)){
+          // Fallback: extract from any in-page AJAX responses (common pattern)
+          const alt = await chrome.scripting.executeScript({ target:{ tabId: tab.id }, func: async ()=>{
+            try{
+              // Search embedded JSON or data attributes for a .zip
+              const txt=document.body.innerHTML || '';
+              const m=txt.match(/https?:\/\/[^\"'\s]+\.zip[^\"'\s]*/i);
+              return { ok: !!m, url: m?m[0]:'' };
+            }catch(e){ return { ok:false }; }
+          }});
+          const r=alt && alt[0] && alt[0].result;
+          if(r && r.ok && r.url){ linkUrl = r.url; }
+        }
+      }catch(_e){}
+
+      // Store as URL (S3 pre-signed) and show in Reports list
+      try{
+        const store=await chrome.storage.local.get(['gmReportsFiles']);
+        const files=Array.isArray(store.gmReportsFiles)?store.gmReportsFiles:[];
+        const name=(()=>{ try{ const p=new URL(linkUrl); const base=p.pathname.split('/').pop()||''; return base||`AutoKinship-${Date.now()}.zip`; }catch(_){ return `AutoKinship-${Date.now()}.zip`; } })();
+        files.unshift({ name, url: linkUrl, savedAt: new Date().toISOString(), sourceUrl: linkUrl, kind: 'autokinship', mime: 'application/zip' });
+        await chrome.storage.local.set({ gmReportsFiles: files });
+        renderReportsFiles(files);
+        await refreshReportStatus();
+        await updateBundleUi();
+        try{ await navLog(kit,{ area:'reports', step:'auto-kinship-saved', name }); }catch(_e){}
+      }catch(e){ console.warn('Auto-Kinship save failed', e); }
+    } else {
+      try{ await navLog(kit,{ area:'reports', step:'auto-kinship-timeout' }); }catch(_e){}
+    }
+    renderReportsLog();
+  }
+
+  // Wire Auto-Kinship button
+  (function setupAutoKinship(){
+    const btn=document.getElementById('btnRunAutoKinship');
+    const kitInput=document.getElementById('oneToManyKit');
+    if(!btn||!kitInput) return;
+    btn.addEventListener('click', async ()=>{
+      const kit=(kitInput.value||'').trim(); if(!kit){ alert('Enter a Kit ID first.'); return; }
+      await runAutoKinshipFlow(kit);
+    });
+  })();
+
+  // Build bundle in memory on demand and download
+  async function downloadBundleNow(){
+    try{
+      const kit=(document.getElementById('oneToManyKit')?.value||'').trim(); if(!kit) return;
+      const store = await chrome.storage.local.get(['gmReportsFiles','gmOcn']);
+      const all = Array.isArray(store.gmReportsFiles)?store.gmReportsFiles:[];
+      const latest = (pred)=> all.find(f=>pred(f));
+      const isOne =(f)=> f?.kind==='one-to-many' || /one-to-many/i.test(f?.name||'');
+      const isSeg =(f)=> f?.kind==='segments' || /segment|match/i.test((f?.name||''));
+      const isAk  =(f)=> f?.kind==='autokinship' || /autokinship|\.zip$/i.test((f?.name||''));
+      const one = latest(isOne); const seg = latest(isSeg); const ak = latest(isAk);
+      if(!(one && seg && ak)) return;
+      const enc = new TextEncoder(); const files=[];
+      if(one?.data) files.push({ name: one.name||'one-to-many.csv', data:new Uint8Array(one.data) });
+      if(seg?.data) files.push({ name: seg.name||'segments.csv', data:new Uint8Array(seg.data) });
+      let akAdded=false;
+      if(ak?.url){ try{ const r=await fetch(ak.url, { credentials:'include' }); const ok = r?.ok && (/zip/i.test(r.headers.get('content-type')||'') || /\.zip(\?|$)/i.test(ak.url)); if(ok){ const b=new Uint8Array(await (await r.blob()).arrayBuffer()); files.push({ name:(ak.name||'AutoKinship.zip').replace(/\?.*$/,''), data:b }); akAdded=true; } }catch(_e){} }
+      if(!akAdded && ak?.data) { files.push({ name: ak.name||'AutoKinship.zip', data:new Uint8Array(ak.data) }); akAdded=true; }
+      if(!akAdded && ak?.url){ files.push({ name:'AutoKinship_URL.txt', data: enc.encode(ak.url) }); }
+      if(!files.length) return;
+      function dosDateTime(dt){ const d=dt||new Date(); const time=(d.getHours()<<11)|(d.getMinutes()<<5)|((d.getSeconds()/2)|0); const date=((d.getFullYear()-1980)<<9)|((d.getMonth()+1)<<5)|d.getDate(); return {time,date}; }
+      const CRC32_TABLE=(function(){ const t=new Uint32Array(256); for(let n=0;n<256;n++){ let c=n; for(let k=0;k<8;k++){ c=(c&1)?(0xEDB88320^(c>>>1)):(c>>>1);} t[n]=c>>>0; } return t; })();
+      function crc32Of(bytes){ let crc=0^0xFFFFFFFF; for(let i=0;i<bytes.length;i++){ crc=CRC32_TABLE[(crc^bytes[i])&0xFF]^(crc>>>8);} return (crc^0xFFFFFFFF)>>>0; }
+      const parts=[]; const centrals=[]; let offset=0;
+      for(const f of files){ const {time,date}=dosDateTime(new Date()); const nameBytes=enc.encode(f.name); const crc=crc32Of(f.data); const lh=new Uint8Array(30+nameBytes.length); const dv=new DataView(lh.buffer); dv.setUint32(0,0x04034b50,true); dv.setUint16(4,20,true); dv.setUint16(6,0,true); dv.setUint16(8,0,true); dv.setUint16(10,time,true); dv.setUint16(12,date,true); dv.setUint32(14,crc,true); dv.setUint32(18,f.data.length,true); dv.setUint32(22,f.data.length,true); dv.setUint16(26,nameBytes.length,true); dv.setUint16(28,0,true); lh.set(nameBytes,30); parts.push(lh, f.data); const ch=new Uint8Array(46+nameBytes.length); const dv2=new DataView(ch.buffer); dv2.setUint32(0,0x02014b50,true); dv2.setUint16(4,20,true); dv2.setUint16(6,20,true); dv2.setUint16(8,0,true); dv2.setUint16(10,0,true); dv2.setUint16(12,time,true); dv2.setUint16(14,date,true); dv2.setUint32(16,crc,true); dv2.setUint32(20,f.data.length,true); dv2.setUint32(24,f.data.length,true); dv2.setUint16(28,nameBytes.length,true); dv2.setUint16(30,0,true); dv2.setUint16(32,0,true); dv2.setUint16(34,0,true); dv2.setUint16(36,0,true); dv2.setUint32(38,0,true); dv2.setUint32(42,offset,true); ch.set(nameBytes,46); centrals.push(ch); offset += lh.length + f.data.length; }
+      const centralSize=centrals.reduce((a,b)=>a+b.length,0); const eocd=new Uint8Array(22); const dv3=new DataView(eocd.buffer); dv3.setUint32(0,0x06054b50,true); dv3.setUint16(4,0,true); dv3.setUint16(6,0,true); dv3.setUint16(8,files.length,true); dv3.setUint16(10,files.length,true); dv3.setUint32(12,centralSize,true); dv3.setUint32(16,offset,true); dv3.setUint16(20,0,true);
+      const blob=new Blob([...parts, ...centrals, eocd], { type:'application/zip' });
+      const url=URL.createObjectURL(blob);
+      const d=new Date(); const m=d.getMonth()+1; const day=d.getDate(); const yyyy=d.getFullYear(); const ocn=(store?.gmOcn||'').trim(); const prefix=ocn?`${ocn}_`:''; const filename=`${prefix}${kit}_gmp_${m}-${day}-${yyyy}.zip`;
+      await chrome.downloads.download({ url, filename, saveAs:true }); setTimeout(()=>URL.revokeObjectURL(url), 10000);
+    }catch(e){ alert('Bundle build failed: '+String(e?.message||e)); }
+  }
+
+  async function updateBundleUi(){
+    try{
+      const kit=(document.getElementById('oneToManyKit')?.value||'').trim();
+      const status=document.getElementById('bundleStatus');
+      const btn=document.getElementById('btnDownloadBundle');
+      if(!status||!btn) return;
+      const store=await chrome.storage.local.get(['gmReportsFiles','gmOcn']);
+      const files=Array.isArray(store.gmReportsFiles)?store.gmReportsFiles:[];
+      const hasOne = files.some(f=>f?.kind==='one-to-many' || /one-to-many/i.test(f?.name||''));
+      const hasSeg = files.some(f=>f?.kind==='segments' || /segment|match/i.test(f?.name||''));
+      const hasAk  = files.some(f=>f?.kind==='autokinship' || /autokinship|\.zip$/i.test(f?.name||''));
+      if(hasOne && hasSeg && hasAk){
+        const d=new Date(); const m=d.getMonth()+1; const day=d.getDate(); const yyyy=d.getFullYear(); const ocn=(store?.gmOcn||'').trim(); const prefix=ocn?`${ocn}_`:''; const fname=kit?`${prefix}${kit}_gmp_${m}-${day}-${yyyy}.zip`:'bundle.zip';
+        status.textContent = `Ready: ${fname}`;
+        btn.disabled=false;
+        btn.onclick = downloadBundleNow;
+      } else {
+        status.textContent = 'Not ready';
+        btn.disabled=true;
+        btn.onclick=null;
+      }
     }catch(_e){}
   }
 })();

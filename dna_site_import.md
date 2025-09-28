@@ -201,6 +201,179 @@ A new Reports tab in the side panel orchestrates:
 
 ---
 
+## Recent Changes (Auto‑Kinship & Bundling)
+
+- Auto‑Kinship capture:
+  - After both One‑to‑Many and Segments CSVs are saved, the extension can auto‑run the Auto‑Kinship workflow for the current kit (a manual button remains for retries).
+  - The flow navigates to `tools/auto-kinship`, fills `edit-kit1`, submits, and waits up to 120s.
+  - We specifically resolve a presigned S3 `.zip` URL (anchors ending in `.zip` only). If the page initially shows a generic “Download Results” button, we wait and gently click it until the `.zip` appears.
+  - Defensive checks: a HEAD request verifies `Content-Type: ...zip`; if a non‑zip page is encountered, we attempt to extract a `.zip` from HTML as fallback.
+  - We store an `autokinship` entry in `gmReportsFiles` with `kind: 'autokinship'` and the presigned URL. We avoid auto‑downloading.
+
+- Reports status & files:
+  - Each saved file now includes a `kind` to avoid name heuristics.
+  - Status dots include a third dot for Auto‑Kinship ZIP.
+  - The downloaded files list supports both in‑memory bytes (CSVs) and URL‑backed ZIPs.
+
+- Bundle assembly (on demand):
+  - When all three artifacts exist, the Bundle section shows “Ready” and enables a Download button.
+  - Clicking Download bundles the two CSV byte arrays plus the Auto‑Kinship ZIP (fetched only if response is actually a ZIP; else a `AutoKinship_URL.txt` placeholder) into `{OCN}_{KIT}_gmp_{M-D-YYYY}.zip`.
+  - ZIP creation uses stored (no‑compression) entries with valid CRC32 values (fixes prior CRC errors).
+  - We do not persist large bundles in `chrome.storage.local`; bundles are generated in memory on demand to avoid quota and memory issues.
+
+- OCN support (reports):
+  - Added an OCN input on the Reports tab; it mirrors the main OCN storage and prefixes the bundle filename when present.
+
+---
+
+## Potential Improvements
+
+- Reports: Drupal click fallbacks
+  - Re-attach Drupal behaviors (`Drupal.attachBehaviors`) when available.
+  - Use `Drupal.ajax` instance `execute()` if bound to the button.
+  - Fallback to `form.requestSubmit(button)`/`form.submit()` and synthetic events.
+  - As a last resort, perform a CDP "physical" click via `chrome.debugger` (user-initiated only).
+
+- Reports: unify one-to-many CSV link extraction
+  - If the link is not in the DOM, POST the form in page context and parse the response:
+    - Parse Drupal AJAX JSON commands to extract inserted markup containing the `.csv` href.
+    - Fallback to parsing returned HTML for `<a href="...csv">`.
+  - Fetch with `credentials: 'include'`, mirror the segments flow, and store in `gmReportsFiles`.
+
+- Reports: status and file management
+  - Refresh progress dots immediately after each save (call `refreshReportStatus()`).
+  - Add "Clear reports" and optionally "Download all (zip)" for `gmReportsFiles`.
+
+- Reports: cross-origin fetch fallback
+  - If extension-context fetch lacks cookies, fetch in page context and return bytes to the panel.
+
+- Reports: multi‑kit runner
+  - Batch run one‑to‑many and segments across a kit list with pacing, progress, and stop/resume.
+
+- Side Panel: wire CDP fallback
+  - Automatically invoke `physicalClickViaDebugger` when all soft attempts fail (explicit user action only).
+
+- Parsing/i18n
+  - Preserve NBSP normalization; consider Unicode letter classification when anchors are absent.
+
+- Observability
+  - Per‑kit run summaries, exportable logs, and additional timeouts/diagnostic breadcrumbs.
+
+- Planned: autoclustering data capture
+  - Automate downloading autoclustering outputs (click sequence + link parsing), store alongside reports with status indicator.
+
+---
+
+## Phase 2 — Bulk Automation Plan
+
+### Goals
+
+- Fully automate the per‑kit workflow at scale (≈1000 kits) with safety, resumability, and politeness.
+- Driver loop obtains work items (OCN, Kit) from a backend endpoint, runs the existing capture/automation steps, builds the bundle, uploads it to the backend/S3, reports success/failure, clears memory, waits a randomized delay (1–2 minutes), and repeats.
+- Be robust to session expiration, timeouts, transient throttling, and permanently removed kits.
+
+### High‑Level Flow
+
+1. Fetch next job from backend (kit, ocn, jobId, run limits).
+2. Set OCN+Kit in panel state; ensure we’re logged in (see Session Detection).
+3. Run Reports pipeline:
+   - One‑to‑Many: navigate → click Search → click Download CSV → resolve link/POST body → save bytes.
+   - Segments: select all → Visualization Options → Search → resolve download via POST/JSON/HTML → save bytes.
+   - Auto‑Kinship: navigate → fill `edit-kit1` → submit → wait for `.zip` anchor → store URL.
+4. Bundle on demand in memory; do not persist bundle in storage.
+5. Upload bundle and metadata to backend; await confirmation.
+6. Mark job complete/failed via backend; persist minimal local log (for diagnostics), purge large files from storage.
+7. Sleep random delay between 60–120s; continue until limit reached or stop requested.
+
+### Backend API (proposed)
+
+- `GET /api/om/jobs/next?agent={id}` → `{ jobId, kit, ocn, attempt, runLimit?, delayMin?, delayMax? }` or `{ jobId: null }` when empty.
+- `POST /api/om/jobs/{jobId}/upload` — options:
+  - Direct upload: `multipart/form-data` with `bundle.zip` and JSON fields `{ kit, ocn, filename, sizes, hashes }`.
+  - Or presigned upload: `GET /api/om/jobs/{jobId}/presign` returns `{ url, fields }`; extension `fetch`es to S3, then calls complete.
+- `POST /api/om/jobs/{jobId}/complete` → `{ status: 'success'|'fail', error?: string, metrics }`.
+- Auth/signature: minimal HMAC header: `X-OM-TS` (unix), `X-OM-SIG = HMAC_SHA256(secret, method+path+ts+bodySha256)`; plus `X-OM-Agent`.
+
+### Extension Runner (Automation tab)
+
+- Config:
+  - Backend base URL, Agent ID, API key/secret.
+  - Max items per run; delay window (default 60–120s); emergency stop threshold (# consecutive errors).
+  - “Start”/“Pause”/“Stop & Clear” controls; current job/kit/ocn display.
+- State (persist in `chrome.storage.local` under `gmAutoRunner`):
+  - `{ running, paused, currentJob: { id, kit, ocn, step }, completedCount, failedCount, consecutiveErrors, lastError, startedAt }`.
+  - Steps: `fetchJob → oneCsv → segCsv → autoKinship → bundle → upload → complete`.
+  - Resumable: on reopen, continue from `step`.
+- Memory hygiene:
+  - Use `gmReportsFiles` only for the three small artifacts; purge after successful upload.
+  - Never persist bundle bytes; build before upload only.
+
+### Session Detection & Pause
+
+- Detect logout/expired session and pause runner with a prompt to log in:
+  - URL redirect to `/user/login` or presence of `form[action*="/user/login"]`, `#edit-name`, `#edit-pass`, `button#edit-submit` on page.
+  - HTML markers: text like “You must log in”, “Access denied”, or `drupalSettings.user.uid === 0` (if readable).
+  - Fetch/HEAD returning 401/403, or HTML login form instead of CSV/ZIP.
+- Behavior: set `gmAutoRunner.paused = true; reason = 'login-required'` and surface “Open Login” button; resume after user confirms logged in.
+
+### Permanent Removal vs Temporary Failure
+
+- Permanent (kit unavailable):
+  - One‑to‑Many page shows “Kit not found”, “This kit is not available”, or returns a result page without a results table repeatedly within timeout.
+  - Auto‑Kinship page returns specific message or no `.zip` after extended timeout.
+  - Mark job `fail` with `reason: 'kit-unavailable'` (do not retry automatically).
+- Temporary (throttle/timeout):
+  - HTTP 429/503, or placements like “Please try again later”.
+  - Exponential backoff (e.g., 5m → 10m → 20m) or emergency stop after N consecutive errors.
+
+### Rate Limiting & Politeness
+
+- Per‑item delay randomized in `[delayMin, delayMax]` (default 60–120s).
+- Single concurrency (one active item at a time).
+- Optional jitter inside a step (e.g., random 500–2000ms before clicks) to mimic human pacing.
+
+### Upload Strategy
+
+- Prefer presigned S3 upload from backend to avoid cross‑origin/session constraints.
+- Alternative: POST bundle to backend, which verifies contents and writes to private S3 over VPN.
+- Include metadata JSON with: kit, ocn, filename, sizes, sha256/sha1 of each inner file, start/end timestamps, durations, and pages used (URLs).
+
+### Logging & Observability
+
+- Per‑kit logs already exist (`gmLogsByKit`). Add `gmAutoRunLog` with high‑level events (job start, step transitions, upload, backoff, pause); cap retention.
+- Expose a compact “Last N events” view in Automation tab; allow JSON export.
+
+### Error Handling & Emergency Stop
+
+- Threshold `N` consecutive errors → auto “Emergency Stop” (runner paused; prominent banner).
+- Surfaces last error, last step, and a “Resume” button once operator intervenes.
+
+### UI Wireframe (Automation tab)
+
+- Controls: Start, Pause, Stop & Clear; Limit (items), Delay min/max; Endpoint, Agent, Secret.
+- Status: Current kit/ocn/jobId; Step; Dots (One, Seg, AK); Next run in T‑seconds.
+- Logs: last N lines; link to full JSON export.
+
+### Security Notes
+
+- Keep API secret only in local extension storage; do not include in per‑request logs.
+- Rotate secret periodically; include timestamp and limited validity in signatures.
+- Optionally pin TLS via VPN; treat presigned URLs as short‑lived.
+
+### Implementation Roadmap
+
+1) Add Automation tab UI and `gmAutoRunner` state machine.
+2) Backend config and HMAC helper; test `GET /jobs/next` happy path.
+3) Integrate existing Reports/Auto‑Kinship pipeline as callable steps; ensure idempotent per step (resume from partial).
+4) Build in‑memory bundle and upload to backend/presigned S3; mark complete.
+5) Delay/jitter and polite pacing; close tabs promptly.
+6) Session detection/pause; login prompt path; resume on confirmation.
+7) Error classification/backoff; emergency stop threshold.
+8) Logging and export; cap retention.
+9) End‑to‑end test with small limit (e.g., 3 items); then ramp.
+
+---
+
 ## Chrome Extension (Unpacked) — Quickstart
 
 Folder contents (root):

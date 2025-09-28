@@ -143,6 +143,23 @@
           <span>Progress:</span>
           <span id="statusOneToMany" class="pill">One-to-Many CSV <span class="dot red" style="margin-left:6px;"></span></span>
           <span id="statusSegments" class="pill">Segments CSV <span class="dot red" style="margin-left:6px;"></span></span>
+          <span id="statusAutoKinship" class="pill">Auto-Kinship ZIP <span class="dot red" style="margin-left:6px;"></span></span>
+        </div>
+      </div>
+      <div class="row">
+        <label class="muted">OCN <input id="ocnInputReports" type="text" placeholder="Case OCN (optional)" style="margin-left:6px; width: 180px" /></label>
+      </div>
+      <div class="row">
+        <div class="muted">Auto-Kinship (requires both CSVs downloaded)</div>
+        <div class="controls" style="margin-top:6px; gap:6px;">
+          <button id="btnRunAutoKinship" class="btn" disabled>Run Auto-Kinship</button>
+        </div>
+      </div>
+      <div class="row">
+        <div class="muted">Bundle</div>
+        <div id="reportsBundle" class="list" style="padding:6px; border:1px solid #ddd; display:flex; gap:12px; align-items:center;">
+          <span id="bundleStatus" class="pill">Not ready</span>
+          <button id="btnDownloadBundle" class="btn" disabled>Download Bundle</button>
         </div>
       </div>
       <div class="row">
