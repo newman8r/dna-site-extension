@@ -2034,19 +2034,33 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
   })();
 
   // Reports: One-to-Many automation
+  let reportsHalted=false;
+  function haltReports(reason){ reportsHalted=true; try{ const lw=document.getElementById('loginWarning'); if(lw) lw.classList.remove('hidden'); }catch(_e){} console.warn('[Reports] halted:', reason); }
+  function ensureNotHalted(){ if(reportsHalted) throw new Error('reports-halted'); }
   const btnRun=document.getElementById('btnRunOneToMany');
   const kitInput=document.getElementById('oneToManyKit');
   if(btnRun&&kitInput){
     btnRun.onclick = async () => {
       const kit=(kitInput.value||'').trim(); if(!kit){ alert('Enter a Kit ID first.'); return; }
+      reportsHalted=false;
       console.log('[Reports] Starting automation for kit:', kit);
       const url=`https://pro.gedmatch.com/tools/one-to-many-segment-based?kit_num=${encodeURIComponent(kit)}`;
       try{ await navLog(kit,{ area:'reports', step:'open-one-to-many', url }); }catch(_e){}
       const tab=await chrome.tabs.create({ url, active: true });
+      // Watch for login redirect early in the one-to-many flow
+      try{
+        chrome.tabs.onUpdated.addListener(function onUpd(id, info){
+          if(id!==tab.id || !info.url) return;
+          if(/https:\/\/auth\.gedmatch\.com\/u\/login\/identifier/i.test(info.url)){
+            haltReports('login-detected');
+            chrome.tabs.onUpdated.removeListener(onUpd);
+          }
+        });
+      }catch(_e){}
       await waitForTabComplete(tab.id, 30000);
       console.log('[Reports] Page loaded, clicking Search button');
       // Auto-click the Search button on the form
-      try{
+      try{ ensureNotHalted();
         await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
           const btn=document.querySelector('button#edit-submit.js-form-submit');
           if(btn){ btn.click(); return { clicked:true }; }
@@ -2057,10 +2071,10 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
         }});
           try{ await navLog(kit,{ area:'reports', step:'one-to-many-search-clicked' }); }catch(_e){}
           renderReportsLog();
-      }catch(e){ console.warn('Auto-click failed', e); }
+      }catch(e){ if(String(e?.message||'')!=='reports-halted'){ console.warn('Auto-click failed', e); } }
       await waitForTabComplete(tab.id, 30000);
       // Click Download CSV button to generate the link
-      try{
+      try{ ensureNotHalted();
         await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
           const dl=document.querySelector('button#edit-download-csv.js-form-submit');
           if(dl){ dl.click(); return { clicked:true }; }
@@ -2070,11 +2084,14 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
         }});
         try{ await navLog(kit,{ area:'reports', step:'one-to-many-download-clicked' }); }catch(_e){}
         renderReportsLog();
-      } catch(e){ console.warn('Download button click failed', e); }
+      } catch(e){ if(String(e?.message||'')!=='reports-halted'){ console.warn('Download button click failed', e); } }
       await waitForTabComplete(tab.id, 30000);
       // Find the generated link by text and fetch the CSV
-      try{
+      try{ ensureNotHalted();
         const execRes = await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
+          if(location.host.includes('auth.gedmatch.com') && location.pathname.includes('/u/login/identifier')){
+            return { ok:false, login:true };
+          }
           const a=[...document.querySelectorAll('a')].find(x=> (x.textContent||'').trim()==='Click here to download file.');
           if(!a) return { ok:false };
           const href=a.getAttribute('href')||a.href||'';
@@ -2082,6 +2099,11 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
           return { ok:Boolean(url), url, filename: (href||'').split('/').pop()||'' };
         }});
         const linkInfo = (execRes && execRes[0] && execRes[0].result) || null;
+        if(linkInfo && linkInfo.login){
+          haltReports('login-detected');
+          try{ await chrome.storage.local.set({ gmReportsFiles: [] }); renderReportsFiles([]); refreshReportStatus(); updateBundleUi(); }catch(_e){}
+          return;
+        }
         try{ await navLog(kit,{ area:'reports', step:'one-to-many-link', ok: !!(linkInfo&&linkInfo.ok), url: linkInfo?.url||null, filename: linkInfo?.filename||null }); }catch(_e){}
         if(linkInfo?.ok && linkInfo.url){
           // Fetch the CSV in the extension context
@@ -2288,9 +2310,9 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
           // Allow AJAX to finish rendering link (no full navigation)
           await new Promise(r=>setTimeout(r, 2000));
         } else {
-          alert('Download link not found.');
+          if(!reportsHalted){ alert('Download link not found.'); }
         }
-      } catch(e){ console.error('Fetch CSV failed', e); alert('Failed to fetch CSV: '+String(e?.message||e)); }
+      } catch(e){ console.error('Fetch CSV failed', e); if(String(e?.message||'')!=='reports-halted'){ alert('Failed to fetch CSV: '+String(e?.message||e)); } }
     };
   }
 
@@ -2488,6 +2510,8 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
     try{
       const store=await chrome.storage.local.get(['gmReportsFiles']);
       const files=Array.isArray(store.gmReportsFiles)?store.gmReportsFiles:[];
+      // Clear any login warning by default
+      try{ const lw=document.getElementById('loginWarning'); if(lw) lw.classList.add('hidden'); }catch(_e){}
       const classify = (f)=>{
         if(f?.kind==='one-to-many') return 'one';
         if(f?.kind==='segments') return 'seg';
@@ -2531,6 +2555,16 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
     try{ await navLog(kit,{ area:'reports', step:'open-auto-kinship' }); }catch(_e){}
     const url='https://pro.gedmatch.com/tools/auto-kinship';
     const tab=await chrome.tabs.create({ url, active:true });
+    // Detect login redirect and surface warning
+    try{
+      chrome.tabs.onUpdated.addListener(function onUpd(id, info, t){
+        if(id!==tab.id || !info.url) return;
+        if(/https:\/\/auth\.gedmatch\.com\/u\/login\/identifier/i.test(info.url)){
+          try{ const lw=document.getElementById('loginWarning'); if(lw) lw.classList.remove('hidden'); }catch(_e){}
+          chrome.tabs.onUpdated.removeListener(onUpd);
+        }
+      });
+    }catch(_e){}
     await waitForTabComplete(tab.id, 30000);
     // Fill kit and submit
     try{
@@ -2555,6 +2589,10 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
     while(Date.now() < deadline){
       try{
         const res = await chrome.scripting.executeScript({ target:{ tabId: tab.id }, func:()=>{
+          // If redirected to login, signal to panel
+          if(location.host.includes('auth.gedmatch.com') && location.pathname.includes('/u/login/identifier')){
+            return { ok:false, login:true };
+          }
           const as=[...document.querySelectorAll('a[href]')];
           // Prefer anchors that directly point to .zip
           const zip = as.map(a=>a.getAttribute('href')||a.href||'').find(h=>/\.zip(\?|$)/i.test(h||''));
@@ -2566,6 +2604,10 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
           return { ok:false };
         }});
         const info = res && res[0] && res[0].result;
+        if(info && info.login){
+          try{ const lw=document.getElementById('loginWarning'); if(lw) lw.classList.remove('hidden'); }catch(_e){}
+          break;
+        }
         if(info && info.ok && info.url){ linkUrl = info.url; break; }
       }catch(_e){}
       // Nudge the page by clicking the visible Download Results button if present
@@ -2596,6 +2638,11 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
         try{ await navLog(kit,{ area:'reports', step:'auto-kinship-saved', name }); }catch(_e){}
       }catch(e){ console.warn('Auto-Kinship save failed', e); }
     } else {
+      // If we hit login anywhere along the way, clear report files to force a clean retry
+      try{
+        const s=await chrome.storage.local.get(['gmReportsFiles']);
+        if(Array.isArray(s.gmReportsFiles) && s.gmReportsFiles.length){ await chrome.storage.local.set({ gmReportsFiles: [] }); renderReportsFiles([]); refreshReportStatus(); updateBundleUi(); }
+      }catch(_e){}
       try{ await navLog(kit,{ area:'reports', step:'auto-kinship-timeout' }); }catch(_e){}
     }
     renderReportsLog();
