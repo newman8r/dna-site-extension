@@ -22,7 +22,13 @@
   ],
   "host_permissions": [
     "https://pro.gedmatch.com/*",
-    "https://*.gedmatch.com/*"
+    "https://*.gedmatch.com/*",
+    "http://localhost/*",
+    "http://localhost:*/*",
+    "http://127.0.0.1/*",
+    "http://127.0.0.1:*/*",
+    "http://192.168.1.240/*",
+    "http://192.168.1.240:*/*"
   ],
   "background": {
     "service_worker": "background.js"
