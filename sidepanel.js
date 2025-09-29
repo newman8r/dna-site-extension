@@ -2014,13 +2014,68 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
     ocnInput.addEventListener('input', async ()=>{ await chrome.storage.local.set({ gmOcn: ocnInput.value.trim() }); });
   }
 
-  // Tabs (Capture / Reports)
+  // Tabs (Capture / Reports / Settings)
   const tabMainBtn=document.getElementById('tabMainBtn');
   const tabReportsBtn=document.getElementById('tabReportsBtn');
+  const tabSettingsBtn=document.getElementById('tabSettingsBtn');
   const panelMain=document.getElementById('panelMain');
   const panelReports=document.getElementById('panelReports');
-  function showPanel(which){ if(which==='reports'){ panelReports.classList.remove('hidden'); panelMain.classList.add('hidden'); tabReportsBtn.classList.add('btn-primary'); tabMainBtn.classList.remove('btn-primary'); } else { panelMain.classList.remove('hidden'); panelReports.classList.add('hidden'); tabMainBtn.classList.add('btn-primary'); tabReportsBtn.classList.remove('btn-primary'); } }
-  if(tabMainBtn&&tabReportsBtn&&panelMain&&panelReports){ tabMainBtn.onclick=()=>showPanel('main'); tabReportsBtn.onclick=()=>showPanel('reports'); }
+  const panelSettings=document.getElementById('panelSettings');
+  
+  function showPanel(which){ 
+    // Hide all panels and remove btn-primary from all tabs
+    [panelMain, panelReports, panelSettings].forEach(p => p?.classList.add('hidden'));
+    [tabMainBtn, tabReportsBtn, tabSettingsBtn].forEach(b => b?.classList.remove('btn-primary'));
+    
+    // Show selected panel and add btn-primary to selected tab
+    if(which==='reports'){ 
+      panelReports?.classList.remove('hidden'); 
+      tabReportsBtn?.classList.add('btn-primary'); 
+    } else if(which==='settings'){ 
+      panelSettings?.classList.remove('hidden'); 
+      tabSettingsBtn?.classList.add('btn-primary');
+    } else { 
+      panelMain?.classList.remove('hidden'); 
+      tabMainBtn?.classList.add('btn-primary'); 
+    } 
+  }
+  
+  if(tabMainBtn&&tabReportsBtn&&tabSettingsBtn){ 
+    tabMainBtn.onclick=()=>showPanel('main'); 
+    tabReportsBtn.onclick=()=>showPanel('reports'); 
+    tabSettingsBtn.onclick=()=>showPanel('settings');
+  }
+  
+  // Settings panel logic
+  (async ()=>{
+    const endpointInput = document.getElementById('atlasEndpoint');
+    const saveBtn = document.getElementById('saveSettings');
+    const savedMsg = document.getElementById('settingsSaved');
+    if(!endpointInput || !saveBtn) return;
+    
+    // Load saved endpoint or use default
+    const DEFAULT_ENDPOINT = 'https://atlas.othram.com:8080/api';
+    const stored = await chrome.storage.local.get(['ATLAS_LEGACY_ENDPOINT']);
+    const currentEndpoint = stored.ATLAS_LEGACY_ENDPOINT || DEFAULT_ENDPOINT;
+    endpointInput.value = currentEndpoint;
+    
+    // Save button handler
+    saveBtn.onclick = async () => {
+      const newEndpoint = endpointInput.value.trim() || DEFAULT_ENDPOINT;
+      // Remove trailing slash if present
+      const cleanEndpoint = newEndpoint.replace(/\/$/, '');
+      await chrome.storage.local.set({ ATLAS_LEGACY_ENDPOINT: cleanEndpoint });
+      
+      // Show saved message
+      savedMsg?.classList.remove('hidden');
+      setTimeout(() => savedMsg?.classList.add('hidden'), 3000);
+    };
+    
+    // Save on Enter key
+    endpointInput.addEventListener('keypress', (e) => {
+      if(e.key === 'Enter') saveBtn.click();
+    });
+  })();
 
   // Reports OCN input mirrors main OCN storage
   (async ()=>{
@@ -2103,7 +2158,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
             let ocn = '';
             try{ ocn=(ocnEl?.value||'').trim(); }catch(_e){}
             if(!ocn){ try{ const s=await chrome.storage.local.get(['gmOcn']); ocn=(s?.gmOcn||'').trim(); }catch(_e){} }
-            const base=(await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT')).ATLAS_LEGACY_ENDPOINT || 'http://localhost:3005';
+            const base=(await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT')).ATLAS_LEGACY_ENDPOINT || 'https://atlas.othram.com:8080/api';
             const form=new FormData(); form.append('ocn', ocn); form.append('kit', kit); form.append('site','PRO'); form.append('status','error'); form.append('notes', errInfo.text||'');
             const resp=await fetch(`${base}/atlas/legacy/save`, { method:'POST', body: form });
             const data=await resp.json().catch(()=>({}));
@@ -2413,7 +2468,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
     btn.addEventListener('click', async ()=>{
       try{
         // Read base endpoint from storage; default localhost
-        const base=(await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT')).ATLAS_LEGACY_ENDPOINT || 'http://localhost:3005';
+        const base=(await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT')).ATLAS_LEGACY_ENDPOINT || 'https://atlas.othram.com:8080/api';
         const resp=await fetch(`${base}/atlas/legacy/next?site=PRO`, { credentials:'include' });
         const data=await resp.json().catch(()=>({}));
         if(!resp.ok || !data?.ok || !data?.item){ alert('No pending legacy items.'); return; }

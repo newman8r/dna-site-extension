@@ -33,6 +33,7 @@
     <div class="row controls">
       <button id="tabMainBtn" class="btn btn-primary">Capture</button>
       <button id="tabReportsBtn" class="btn">Reports (beta)</button>
+      <button id="tabSettingsBtn" class="btn">Settings</button>
     </div>
     <div id="panelMain">
     <div class="row">
@@ -176,6 +177,32 @@
         <div id="reportsLog" class="list" style="max-height: 220px; overflow:auto; border:1px solid #ddd; padding:6px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size: 11px; white-space: pre-wrap;"></div>
       </div>
     </div>
+    
+    <div id="panelSettings" class="hidden">
+      <div class="row">
+        <h2 style="font-size: 14px; margin: 12px 0 8px;">Backend Configuration</h2>
+      </div>
+      <div class="row">
+        <label for="atlasEndpoint" style="display: block; margin-bottom: 4px;">
+          <span class="muted">Atlas Backend URL</span>
+        </label>
+        <input type="text" id="atlasEndpoint" style="width: 100%; padding: 6px; border: 1px solid #ddd; border-radius: 4px;" placeholder="https://atlas.othram.com:8080/api" />
+        <div class="muted" style="margin-top: 4px; font-size: 11px;">
+          Default: https://atlas.othram.com:8080/api<br/>
+          For local development: http://localhost:3005
+        </div>
+      </div>
+      <div class="row" style="margin-top: 12px;">
+        <button id="saveSettings" class="btn btn-primary">Save Settings</button>
+        <span id="settingsSaved" class="muted hidden" style="margin-left: 8px; color: #43a047;">✓ Settings saved</span>
+      </div>
+      <div class="row" style="margin-top: 20px; padding-top: 12px; border-top: 1px solid #ddd;">
+        <div class="muted" style="font-size: 11px;">
+          <strong>Note:</strong> Changes take effect immediately for all new requests.
+        </div>
+      </div>
+    </div>
+    
     <script src="sidepanel.js"></script>
   </body>
 </html>

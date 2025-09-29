@@ -23,6 +23,8 @@
   "host_permissions": [
     "https://pro.gedmatch.com/*",
     "https://*.gedmatch.com/*",
+    "https://atlas.othram.com/*",
+    "https://atlas.othram.com:*/*",
     "http://localhost/*",
     "http://localhost:*/*",
     "http://127.0.0.1/*",
