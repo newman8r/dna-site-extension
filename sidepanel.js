@@ -42,6 +42,35 @@ function toRecords(header, body) {
   }));
 }
 
+// Extract top-of-file metadata like Reference Kit and Date Exported from the first few rows
+function extractTopMeta(rows){
+  const out={ referenceKit:null, dateExported:null };
+  const MAX_SCAN=Math.min(rows.length, 10);
+  for(let ri=0; ri<MAX_SCAN; ri++){
+    const row=rows[ri]||[];
+    for(let ci=0; ci<row.length; ci++){
+      const cell=String(row[ci]||'').trim(); if(!cell) continue;
+      // Reference Kit
+      if(/\breference\s*kit\b/i.test(cell)){
+        const next=String(row[ci+1]||'').trim();
+        if(next){ out.referenceKit = next; }
+        else {
+          const m=cell.match(/reference\s*kit\s*[:\-]?\s*(\S+)/i); if(m&&m[1]) out.referenceKit=m[1];
+        }
+      }
+      // Date Exported
+      if(/\bdate\s*exported\b/i.test(cell)){
+        const next=String(row[ci+1]||'').trim();
+        if(next){ out.dateExported = next; }
+        else {
+          const m=cell.match(/date\s*exported\s*[:\-]?\s*(.+)$/i); if(m&&m[1]) out.dateExported=m[1].trim();
+        }
+      }
+    }
+  }
+  return out;
+}
+
 function classifyGedLink(s) {
   const out={ type:'none', url:'', raw: s||'' };
   if(!s) return out; const t=String(s).trim(); if(!t || t==='null') return out;
@@ -70,7 +99,7 @@ function resolveGedUrl(s){
 }
 
 async function getState() {
-  const s = await chrome.storage.local.get(['gmGedmatchSession','gmGedmatchPendingMeta','gmPendingCsvText','gmStatusByKit','gmFocusedKit','gmCapturedByKit','gmLogsByKit','gmAllCsvRecords']);
+  const s = await chrome.storage.local.get(['gmGedmatchSession','gmGedmatchPendingMeta','gmPendingCsvText','gmStatusByKit','gmFocusedKit','gmCapturedByKit','gmLogsByKit','gmAllCsvRecords','gmOcn']);
   return {
     session: s.gmGedmatchSession || { profiles: [], queueIndex: 0, bundle: null },
     pendingMeta: s.gmGedmatchPendingMeta || null,
@@ -79,7 +108,8 @@ async function getState() {
     focusedKit: s.gmFocusedKit || null,
     capturedByKit: s.gmCapturedByKit || {},
     logsByKit: s.gmLogsByKit || {},
-    allRecords: s.gmAllCsvRecords || []
+    allRecords: s.gmAllCsvRecords || [],
+    ocn: s.gmOcn || ''
   };
 }
 
@@ -181,11 +211,15 @@ function emitSegmentLinesForKit(kit, segList){ const lines=[]; if(!kit||!Array.i
 
 function buildSessionFromText(text) {
   const rows = parseCsv(text);
+  const topMeta = extractTopMeta(rows);
   const { header, body } = normalizeHeaderRow(rows);
   if (header.length === 0) return { error: 'Invalid CSV: header not found' };
   const recs = toRecords(header, body).map(r => { const cl=classifyGedLink(r.GedLink); return { ...r, treeUrl: cl.type==='gedmatch'?cl.url:'', treeType: cl.type, rawTreeLink: cl.raw }; });
   const profiles = recs.filter(r => r.treeType==='gedmatch');
-  return { session: { profiles, queueIndex: 0, bundle: { exportedAt: new Date().toISOString(), source: { site: 'GEDmatch' }, profiles, captures: [] } }, allRecords: recs };
+  const source={ site:'GEDmatch' };
+  if(topMeta.referenceKit) source.referenceKit=topMeta.referenceKit;
+  if(topMeta.dateExported) source.dateExported=topMeta.dateExported;
+  return { session: { profiles, queueIndex: 0, bundle: { exportedAt: new Date().toISOString(), source, profiles, captures: [] } }, allRecords: recs };
 }
 
 const MONTHS = { jan:'JAN', feb:'FEB', mar:'MAR', apr:'APR', may:'MAY', jun:'JUN', jul:'JUL', aug:'AUG', sep:'SEP', sept:'SEP', oct:'OCT', nov:'NOV', dec:'DEC' };
@@ -206,7 +240,31 @@ async function extractPreFromActiveTab(){
   if(!ok?.result?.ok) throw new Error(ok?.result?.error||'pre not found');
   return ok.result; }
 
+// Extract the pedigree <pre> from a specific tab, avoiding active tab races
+async function extractPreFromTabId(tabId){
+  if(!tabId) throw new Error('No tabId provided');
+  const frames = await chrome.scripting.executeScript({ target:{tabId, allFrames:true}, func:()=>{ function collectFrom(root){ const rect=root.getBoundingClientRect(); const anchors=Array.from(root.querySelectorAll('a')).map(a=>{ const r=a.getBoundingClientRect(); const font=a.querySelector('font'); const color=(font?.getAttribute('color')||'').toLowerCase(); return { label:(a.textContent||'').trim(), href:a.getAttribute('href')||a.href||'', color, x: Math.round(r.left-rect.left), y: Math.round(r.top-rect.top) }; }); return { html: root.innerHTML, text: root.innerText, anchors }; }
+    const pre=document.querySelector('section.response-items pre')||document.querySelector('pre');
+    if(pre){ const data=collectFrom(pre); return { ok:true, ...data, frame: window.location.href } }
+    const container=document.querySelector('section.response-items')||document.querySelector('.response-items')||document.body;
+    if(container){ const data=collectFrom(container); return { ok:true, ...data, note:'fallback-no-pre', frame: window.location.href } }
+    return { ok:false, error:'pre not found' };
+  }});
+  const ok=frames.find(f=>f?.result?.ok);
+  if(!ok?.result?.ok) throw new Error(ok?.result?.error||'pre not found');
+  return ok.result;
+}
+
 function isPedigreeUrl(u){ try{ const x=new URL(u); return x.hostname==='pro.gedmatch.com' && x.pathname.includes('/tools/gedcom/pedigree-chart'); } catch { return false; } }
+
+function parsePedigreeParams(urlStr){
+  try{ const u=new URL(urlStr); return { id_family: u.searchParams.get('id_family')||'', id_ged: u.searchParams.get('id_ged')||'' }; } catch { return { id_family:'', id_ged:'' }; }
+}
+function samePedigreeTarget(expectedUrl, actualUrl){
+  if(!expectedUrl || !actualUrl) return false;
+  const a=parsePedigreeParams(expectedUrl); const b=parsePedigreeParams(actualUrl);
+  return Boolean(a.id_family) && Boolean(a.id_ged) && a.id_family===b.id_family && a.id_ged===b.id_ged;
+}
 
 function clusterRows(anchors){ const sorted=[...anchors].sort((a,b)=>a.y-b.y); const rows=[]; const ys=[]; for(const a of sorted){ if(!ys.length || Math.abs(a.y-ys[ys.length-1])>14){ ys.push(a.y); rows.push([a]); } else { rows[rows.length-1].push(a); } } return rows; }
 
@@ -464,8 +522,8 @@ function buildIntermediaryRows(result){
   const text=(result.text||'').replace(/\u00a0/g,' ');
   const lines=text.split(/\r?\n/);
   let anchors=[];
-  if(Array.isArray(result.anchors)&&result.anchors.length){ anchors=result.anchors.map(a=>({ label:(a.label||'').trim(), href:a.href||'', color:(a.color||'').toLowerCase(), x: typeof a.x==='number'?a.x:null, y: typeof a.y==='number'?a.y:null })); }
-  else { const container=document.createElement('div'); container.innerHTML=result.html||''; anchors=Array.from(container.querySelectorAll('a')).map(a=>{ const font=a.querySelector('font'); return { label:(a.textContent||'').trim(), href:a.getAttribute('href')||'', color:(font?.getAttribute('color')||'').toLowerCase(), x:null, y:null }; }); }
+  if(Array.isArray(result.anchors)&&result.anchors.length){ anchors=result.anchors.map(a=>{ const raw=(a.label||''); const label=(raw||'').trim(); const labelNorm=label.replace(/\u00a0/g,' '); return { label, labelNorm, href:a.href||'', color:(a.color||'').toLowerCase(), x: typeof a.x==='number'?a.x:null, y: typeof a.y==='number'?a.y:null }; }); }
+  else { const container=document.createElement('div'); container.innerHTML=result.html||''; anchors=Array.from(container.querySelectorAll('a')).map(a=>{ const font=a.querySelector('font'); const raw=(a.textContent||''); const label=(raw||'').trim(); const labelNorm=label.replace(/\u00a0/g,' '); return { label, labelNorm, href:a.getAttribute('href')||'', color:(font?.getAttribute('color')||'').toLowerCase(), x:null, y:null }; }); }
 
   function pairOutermost(lefts, rights){ const segs=[]; let li=0; let ri=rights.length-1; while(li<lefts.length && ri>=0){ const l=lefts[li]; while(ri>=0 && rights[ri]<=l) ri--; if(ri<0) break; const r=rights[ri--]; if(r>l) segs.push({ L:l, R:r, mid: Math.floor((l+r)/2) }); li++; } return segs; }
 
@@ -481,23 +539,26 @@ function buildIntermediaryRows(result){
     const persons=[]; const controls=[]; {
       const matchIdxs=[];
       for(let ai=0; ai<anchors.length; ai++){
-        const a=anchors[ai]; if(!a.label) continue; if(s.indexOf(a.label)!==-1) matchIdxs.push(ai);
+        const a=anchors[ai]; const lbl=(a.labelNorm||a.label||''); if(!lbl) continue; if(s.indexOf(lbl)!==-1) matchIdxs.push(ai);
       }
       // pick the first unused matching anchor (there should be exactly one person per line)
       const chosenIdx=matchIdxs.find(ai=>!usedAnchor[ai]);
       if(chosenIdx!=null){
         const a=anchors[chosenIdx]; usedAnchor[chosenIdx]=true;
-        const idx=s.indexOf(a.label);
-        // detect navigation/expand anchors (e.g., '=>', '>>', arrows) — labels with no letters
-        const isControl = !/[A-Za-z]/.test(a.label);
+        const lbl=(a.labelNorm||a.label||'');
+        let idx=s.indexOf(lbl);
+        // detect navigation/expand anchors (e.g., '=>', '>>', arrows) — labels with no letters (Unicode-aware)
+        const hasLetters=/\p{L}/u.test(lbl);
+        const isControl = !hasLetters;
         if(isControl){
           controls.push({ kind:'expand', col: idx, label: a.label, href: resolveGedUrl(a.href||'') });
         } else {
-          const parsed=parsePersonLabel(a.label);
+          const parsed=parsePersonLabel(lbl);
+          if(idx===-1){ const nameOnly=(parsed?.name||'').trim(); if(nameOnly){ idx=s.indexOf(nameOnly); } }
           const sex=a.color==='red'?'F':a.color==='blue'?'M':'U';
           const url=resolveGedUrl(a.href||'');
           const indentRaw=idx; const px=a.x;
-          const rec={ label:a.label, name:parsed.name, birth:parsed.birth, death:parsed.death, sex, url, col:idx, indentRaw, px, indent:null, leadingSpaces:(s.match(/^\s*/)||[''])[0].length };
+          const rec={ label:lbl, name:parsed.name, birth:parsed.birth, death:parsed.death, sex, url, col:idx, indentRaw, px, indent:null, leadingSpaces:(s.match(/^\s*/)||[''])[0].length };
           persons.push(rec); personRefs.push({ line:i, ref:rec });
         }
       }
@@ -1638,6 +1699,7 @@ async function buildGedcom(people, meta, families){
   } catch(_){ }
   const now=new Date(); const yyyy=now.getFullYear(); const mm=String(now.getMonth()+1).padStart(2,'0'); const dd=String(now.getDate()).padStart(2,'0');
   const head=[ '0 HEAD','1 SOUR GedMapper','2 NAME GedMapper GEDmatch Capture','2 VERS 0.1','1 DATE '+`${yyyy}-${mm}-${dd}`,'1 SUBM @SUB1@','1 GEDC','2 VERS 5.5.1','2 FORM LINEAGE-LINKED','1 CHAR UTF-8' ]; if(meta?.kit) head.push('1 _OM_REFERENCE_KIT '+meta.kit);
+  try { const ocnStore = await chrome.storage.local.get(['gmOcn']); const ocnVal=(ocnStore?.gmOcn||'').trim(); if(ocnVal){ head.push('1 _OM_OCN '+ocnVal); } } catch(_e) {}
   const subm=[ '0 @SUB1@ SUBM','1 NAME GEDmatch Importer User' ];
   const indiPtr = (i)=>`@I${i+1}@`; // index based on array order
   // Load segments index once
@@ -1701,14 +1763,29 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
     let captured=0; for(const t of trees){
       try{
         const tab=await chrome.tabs.create({ url:t.pedigreeUrl, active:false });
-        await new Promise(r=>setTimeout(r, 800));
-        const pre=await extractPreFromActiveTab(); // operates on active tab; switch
-        await chrome.tabs.update(tab.id, { active:true });
+        const ok=await waitForTabComplete(tab.id, 20000);
+        if(!ok){ await chrome.tabs.remove(tab.id); continue; }
+        // Verify URL target and extract with retries
+        let attempts=0; let pre=null;
+        while(attempts++<3){
+          try{
+            pre=await extractPreFromTabId(tab.id);
+            if(isPedigreeUrl(pre?.frame||'') && samePedigreeTarget(t.pedigreeUrl, pre.frame)) break;
+          }catch{ /* retry */ }
+          await chrome.tabs.update(tab.id, { url: t.pedigreeUrl });
+          await waitForTabComplete(tab.id, 20000);
+          await new Promise(r=>setTimeout(r, 300));
+        }
+        if(!pre || !isPedigreeUrl(pre?.frame||'') || !samePedigreeTarget(t.pedigreeUrl, pre.frame)){
+          await navLog(kit,{ step:'auto-tree-skip-mismatch', expected:t.pedigreeUrl, actual:pre?.frame||null });
+          await chrome.tabs.remove(tab.id);
+          continue;
+        }
         const rowsJson=buildIntermediaryRows(pre);
         const built=buildFamiliesFromRowsV9(rowsJson);
         const profile=session.profiles.find(x=>x.Kit===kit);
-      const gedcom=await buildGedcom(built.people,{ kit, rootName: profile?.Name||'', atdnaTotal: profile?.AtdnaTotal||'' }, built.families);
-        await saveCapture(kit,{ rowsJson, gedcom, count: built.people.length, families: built.families.length, capturedAt:new Date().toISOString(), sourceUrl: t.pedigreeUrl }, built.logs);
+        const gedcom=await buildGedcom(built.people,{ kit, rootName: profile?.Name||'', atdnaTotal: profile?.AtdnaTotal||'' }, built.families);
+        await saveCapture(kit,{ rowsJson, gedcom, count: built.people.length, families: built.families.length, capturedAt:new Date().toISOString(), sourceUrl: pre?.frame||t.pedigreeUrl }, built.logs);
         captured++;
         await chrome.tabs.remove(tab.id);
       } catch(e){ console.error('Auto capture failed', e); }
@@ -1720,13 +1797,26 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
   document.getElementById('autoAllCsv').onclick = async () => {
     const st=await getState(); const profiles=st.session.profiles||[]; if(!profiles.length){ alert('No profiles loaded.'); return; }
     let completed=0; for(const p of profiles){ try{
-      // open the kit URL and allow our content.js to auto-navigate to pedigree
-      if(!p.treeUrl) continue; const tab=await chrome.tabs.create({ url:p.treeUrl, active:true });
+      if(!p.treeUrl) continue; const tab=await chrome.tabs.create({ url:p.treeUrl, active:false });
       await navLog(p.Kit,{ step:'auto-all-opened', url:p.treeUrl });
       const loaded=await waitForTabComplete(tab.id); await navLog(p.Kit,{ step:'auto-all-tab-complete', loaded });
-      // give the content script time to jump to pedigree
-      await new Promise(r=>setTimeout(r, 800));
-      const preInfo=await extractPreFromActiveTab(); if(!isPedigreeUrl(preInfo?.frame||'')) { await navLog(p.Kit,{ step:'auto-all-skip-non-pedigree', frame:preInfo?.frame||'' }); await chrome.tabs.remove(tab.id); continue; }
+      // Let content.js compute nextUrl if list/individual
+      const nav=await autoNavigateToPedigree(tab.id);
+      if(nav?.nextUrl){ try{ await chrome.runtime.sendMessage({ type:'gm-nav-to-url', tabId:tab.id, url:nav.nextUrl }); await navLog(p.Kit,{ step:'background-nav', url:nav.nextUrl }); } catch(e){ await navLog(p.Kit,{ step:'background-nav-error', error:String(e) }); } }
+      await waitForTabComplete(tab.id);
+      // Retry extract and verify pedigree target
+      let attempts=0; let preInfo=null;
+      while(attempts++<3){
+        try{ preInfo=await extractPreFromTabId(tab.id); } catch { preInfo=null; }
+        const ok=isPedigreeUrl(preInfo?.frame||'');
+        const match = nav?.nextUrl ? samePedigreeTarget(nav.nextUrl, preInfo?.frame||'') : ok;
+        if(ok && match) break;
+        // enforce navigation if mismatch
+        if(nav?.nextUrl){ await chrome.tabs.update(tab.id, { url: nav.nextUrl }); await waitForTabComplete(tab.id); }
+        await new Promise(r=>setTimeout(r, 300));
+      }
+      if(!preInfo || !isPedigreeUrl(preInfo?.frame||'')){ await navLog(p.Kit,{ step:'auto-all-skip-non-pedigree', frame:preInfo?.frame||'' }); await chrome.tabs.remove(tab.id); continue; }
+      if(nav?.nextUrl && !samePedigreeTarget(nav.nextUrl, preInfo.frame)){ await navLog(p.Kit,{ step:'auto-all-mismatch', expected:nav.nextUrl, actual:preInfo.frame }); await chrome.tabs.remove(tab.id); continue; }
       const rowsJson=buildIntermediaryRows(preInfo);
       const built=buildFamiliesFromRowsV9(rowsJson);
       const gedcom=await buildGedcom(built.people,{ kit:p.Kit, rootName: p?.Name||'', atdnaTotal: p?.AtdnaTotal||'' }, built.families);
@@ -1792,17 +1882,29 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
       files.push({ name:'gedmatch-floating-individuals.ged', data: enc.encode(lines.join('\n')) });
     }
     function dosDateTime(dt){ const d=dt||new Date(); const time=(d.getHours()<<11)|(d.getMinutes()<<5)|((d.getSeconds()/2)|0); const date=((d.getFullYear()-1980)<<9)|((d.getMonth()+1)<<5)|d.getDate(); return {time,date}; }
+    // CRC32 helper (store method requires CRC in headers)
+    const CRC32_TABLE=(function(){ const t=new Uint32Array(256); for(let n=0;n<256;n++){ let c=n; for(let k=0;k<8;k++){ c=(c&1)?(0xEDB88320^(c>>>1)):(c>>>1);} t[n]=c>>>0; } return t; })();
+    function crc32Of(bytes){ let crc=0^0xFFFFFFFF; for(let i=0;i<bytes.length;i++){ crc=CRC32_TABLE[(crc^bytes[i])&0xFF]^(crc>>>8);} return (crc^0xFFFFFFFF)>>>0; }
     const parts=[]; const centrals=[]; let offset=0; for(const f of files){ const {time,date}=dosDateTime(new Date()); const nameBytes=enc.encode(f.name);
+      const crc=crc32Of(f.data);
       const lh=new Uint8Array(30+nameBytes.length); const dv=new DataView(lh.buffer);
-      dv.setUint32(0,0x04034b50,true); dv.setUint16(4,20,true); dv.setUint16(6,0,true); dv.setUint16(8,0,true); dv.setUint16(10,time,true); dv.setUint16(12,date,true); dv.setUint32(14,0,true); dv.setUint32(18,f.data.length,true); dv.setUint32(22,f.data.length,true); dv.setUint16(26,nameBytes.length,true); dv.setUint16(28,0,true); lh.set(nameBytes,30);
+      dv.setUint32(0,0x04034b50,true); dv.setUint16(4,20,true); dv.setUint16(6,0,true); dv.setUint16(8,0,true); dv.setUint16(10,time,true); dv.setUint16(12,date,true); dv.setUint32(14,crc,true); dv.setUint32(18,f.data.length,true); dv.setUint32(22,f.data.length,true); dv.setUint16(26,nameBytes.length,true); dv.setUint16(28,0,true); lh.set(nameBytes,30);
       parts.push(lh, f.data);
       const ch=new Uint8Array(46+nameBytes.length); const dv2=new DataView(ch.buffer);
-      dv2.setUint32(0,0x02014b50,true); dv2.setUint16(4,20,true); dv2.setUint16(6,20,true); dv2.setUint16(8,0,true); dv2.setUint16(10,0,true); dv2.setUint16(12,time,true); dv2.setUint16(14,date,true); dv2.setUint32(16,0,true); dv2.setUint32(20,f.data.length,true); dv2.setUint32(24,f.data.length,true); dv2.setUint16(28,nameBytes.length,true); dv2.setUint16(30,0,true); dv2.setUint16(32,0,true); dv2.setUint16(34,0,true); dv2.setUint16(36,0,true); dv2.setUint32(38,0,true); dv2.setUint32(42,offset,true); ch.set(nameBytes,46);
+      dv2.setUint32(0,0x02014b50,true); dv2.setUint16(4,20,true); dv2.setUint16(6,20,true); dv2.setUint16(8,0,true); dv2.setUint16(10,0,true); dv2.setUint16(12,time,true); dv2.setUint16(14,date,true); dv2.setUint32(16,crc,true); dv2.setUint32(20,f.data.length,true); dv2.setUint32(24,f.data.length,true); dv2.setUint16(28,nameBytes.length,true); dv2.setUint16(30,0,true); dv2.setUint16(32,0,true); dv2.setUint16(34,0,true); dv2.setUint16(36,0,true); dv2.setUint32(38,0,true); dv2.setUint32(42,offset,true); ch.set(nameBytes,46);
       centrals.push(ch); offset += lh.length + f.data.length; }
     const centralSize=centrals.reduce((a,b)=>a+b.length,0); const eocd=new Uint8Array(22); const dv3=new DataView(eocd.buffer);
     dv3.setUint32(0,0x06054b50,true); dv3.setUint16(4,0,true); dv3.setUint16(6,0,true); dv3.setUint16(8,files.length,true); dv3.setUint16(10,files.length,true); dv3.setUint32(12,centralSize,true); dv3.setUint32(16,offset,true); dv3.setUint16(20,0,true);
     const blob=new Blob([...parts, ...centrals, eocd], { type:'application/zip' });
-    const url=URL.createObjectURL(blob); const filename=`gedmatch-captures-${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.zip`;
+    const url=URL.createObjectURL(blob);
+    // Build filename: {OCN}_{ReferenceKit}_gmp_{M-D-YYYY}.zip
+    let refKit=''; try{ refKit=String(store?.gmGedmatchSession?.bundle?.source?.referenceKit||'').trim(); }catch(_e){}
+    let ocn=''; try{ ocn=String((await getState()).ocn||'').trim(); }catch(_e){}
+    const d=new Date(); const m=d.getMonth()+1; const day=d.getDate(); const yyyy=d.getFullYear();
+    const dateStr=`${m}-${day}-${yyyy}`;
+    const partsPrefix=[ocn||null, refKit||null].filter(Boolean).join('_');
+    const prefix = partsPrefix ? `${partsPrefix}_` : '';
+    const filename=`${prefix}gmp_${dateStr}.zip`;
     await chrome.downloads.download({ url, filename, saveAs:true }); setTimeout(()=>URL.revokeObjectURL(url), 10000);
   };
 
@@ -1894,4 +1996,1007 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
       alert(`Parsed ASCII: ${people.length} people, ${families.length} families`);
     } catch(e){ console.error('Parse ASCII failed', e); alert('Parse ASCII failed: '+(e?.message||e)); }
   };
+  // Advanced panel toggle
+  const advToggle=document.getElementById('advToggle');
+  const advPanel=document.getElementById('advancedPanel');
+  if(advToggle && advPanel){
+    advToggle.addEventListener('click', (e)=>{
+      e.preventDefault();
+      const hidden=advPanel.classList.contains('hidden');
+      if(hidden){ advPanel.classList.remove('hidden'); advToggle.textContent='Hide advanced'; }
+      else { advPanel.classList.add('hidden'); advToggle.textContent='Show advanced'; }
+    });
+  }
+  // OCN input persist
+  const ocnInput=document.getElementById('ocnInput');
+  if(ocnInput){
+    ocnInput.value = (await getState()).ocn || '';
+    ocnInput.addEventListener('input', async ()=>{ await chrome.storage.local.set({ gmOcn: ocnInput.value.trim() }); });
+  }
+
+  // Tabs (Capture / Reports / Settings)
+  const tabMainBtn=document.getElementById('tabMainBtn');
+  const tabReportsBtn=document.getElementById('tabReportsBtn');
+  const tabSettingsBtn=document.getElementById('tabSettingsBtn');
+  const panelMain=document.getElementById('panelMain');
+  const panelReports=document.getElementById('panelReports');
+  const panelSettings=document.getElementById('panelSettings');
+  
+  function showPanel(which){ 
+    // Hide all panels and remove btn-primary from all tabs
+    [panelMain, panelReports, panelSettings].forEach(p => p?.classList.add('hidden'));
+    [tabMainBtn, tabReportsBtn, tabSettingsBtn].forEach(b => b?.classList.remove('btn-primary'));
+    
+    // Show selected panel and add btn-primary to selected tab
+    if(which==='reports'){ 
+      panelReports?.classList.remove('hidden'); 
+      tabReportsBtn?.classList.add('btn-primary'); 
+    } else if(which==='settings'){ 
+      panelSettings?.classList.remove('hidden'); 
+      tabSettingsBtn?.classList.add('btn-primary');
+    } else { 
+      panelMain?.classList.remove('hidden'); 
+      tabMainBtn?.classList.add('btn-primary'); 
+    } 
+  }
+  
+  if(tabMainBtn&&tabReportsBtn&&tabSettingsBtn){ 
+    tabMainBtn.onclick=()=>showPanel('main'); 
+    tabReportsBtn.onclick=()=>showPanel('reports'); 
+    tabSettingsBtn.onclick=()=>showPanel('settings');
+  }
+  
+  // Settings panel logic
+  (async ()=>{
+    const endpointInput = document.getElementById('atlasEndpoint');
+    const saveBtn = document.getElementById('saveSettings');
+    const savedMsg = document.getElementById('settingsSaved');
+    if(!endpointInput || !saveBtn) return;
+    
+    // Load saved endpoint or use default
+    const DEFAULT_ENDPOINT = 'https://atlas.othram.com:8080/api';
+    const stored = await chrome.storage.local.get(['ATLAS_LEGACY_ENDPOINT']);
+    const currentEndpoint = stored.ATLAS_LEGACY_ENDPOINT || DEFAULT_ENDPOINT;
+    endpointInput.value = currentEndpoint;
+    
+    // Save button handler
+    saveBtn.onclick = async () => {
+      const newEndpoint = endpointInput.value.trim() || DEFAULT_ENDPOINT;
+      // Remove trailing slash if present
+      const cleanEndpoint = newEndpoint.replace(/\/$/, '');
+      await chrome.storage.local.set({ ATLAS_LEGACY_ENDPOINT: cleanEndpoint });
+      
+      // Show saved message
+      savedMsg?.classList.remove('hidden');
+      setTimeout(() => savedMsg?.classList.add('hidden'), 3000);
+    };
+    
+    // Save on Enter key
+    endpointInput.addEventListener('keypress', (e) => {
+      if(e.key === 'Enter') saveBtn.click();
+    });
+  })();
+
+  // Reports OCN input mirrors main OCN storage
+  (async ()=>{
+    try{
+      const el=document.getElementById('ocnInputReports');
+      if(!el) return;
+      const s=await chrome.storage.local.get(['gmOcn']);
+      el.value=(s?.gmOcn||'');
+      el.addEventListener('input', async ()=>{ await chrome.storage.local.set({ gmOcn: el.value.trim() }); });
+    }catch(_e){}
+  })();
+
+  // Reports: One-to-Many automation
+  let reportsHalted=false;
+  function haltReports(reason){ reportsHalted=true; try{ const lw=document.getElementById('loginWarning'); if(lw) lw.classList.remove('hidden'); }catch(_e){} console.warn('[Reports] halted:', reason); }
+  function ensureNotHalted(){ if(reportsHalted) throw new Error('reports-halted'); }
+  // Auto-save guard to avoid duplicate uploads
+  const autoSaveAtlasGuard={ inProgress:false, lastKey:'' };
+  // Auto-run state
+  const autoRunState={ remaining:0, delaySec:0, running:false };
+  const btnRun=document.getElementById('btnRunOneToMany');
+  const kitInput=document.getElementById('oneToManyKit');
+  if(btnRun&&kitInput){
+    btnRun.onclick = async () => {
+      const kit=(kitInput.value||'').trim(); if(!kit){ alert('Enter a Kit ID first.'); return; }
+      reportsHalted=false;
+      // Clear previous report artifacts to ensure a clean 3-file run (one, seg, ak)
+      try{
+        await chrome.storage.local.set({ gmReportsFiles: [] });
+        renderReportsFiles([]);
+        await refreshReportStatus();
+        await updateBundleUi();
+        try{ const lw=document.getElementById('loginWarning'); if(lw) lw.classList.add('hidden'); }catch(_e){}
+      }catch(_e){}
+      console.log('[Reports] Starting automation for kit:', kit);
+      const url=`https://pro.gedmatch.com/tools/one-to-many-segment-based?kit_num=${encodeURIComponent(kit)}`;
+      try{ await navLog(kit,{ area:'reports', step:'open-one-to-many', url }); }catch(_e){}
+      const tab=await chrome.tabs.create({ url, active: true });
+      // Watch for login redirect early in the one-to-many flow
+      try{
+        chrome.tabs.onUpdated.addListener(function onUpd(id, info){
+          if(id!==tab.id || !info.url) return;
+          if(/https:\/\/auth\.gedmatch\.com\/u\/login\/identifier/i.test(info.url)){
+            haltReports('login-detected');
+            chrome.tabs.onUpdated.removeListener(onUpd);
+          }
+        });
+      }catch(_e){}
+      await waitForTabComplete(tab.id, 30000);
+      console.log('[Reports] Page loaded, clicking Search button');
+      // Auto-click the Search button on the form
+      try{ ensureNotHalted();
+        await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
+          const btn=document.querySelector('button#edit-submit.js-form-submit');
+          if(btn){ btn.click(); return { clicked:true }; }
+          // Drupal often injects submit input too
+          const alt=document.querySelector('input#edit-submit[type="submit"]');
+          if(alt){ alt.click(); return { clicked:true, alt:true }; }
+          return { clicked:false };
+        }});
+          try{ await navLog(kit,{ area:'reports', step:'one-to-many-search-clicked' }); }catch(_e){}
+          renderReportsLog();
+      }catch(e){ if(String(e?.message||'')!=='reports-halted'){ console.warn('Auto-click failed', e); } }
+      await waitForTabComplete(tab.id, 30000);
+      // After search completes, check for inline error message (e.g., access denied)
+      try{
+        const resErr = await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
+          const el=document.querySelector('.form-item--error-message');
+          const txt=(el && (el.textContent||'').trim())||'';
+          return { has: !!txt, text: txt };
+        }});
+        const errInfo = resErr && resErr[0] && resErr[0].result;
+        if(errInfo && errInfo.has){
+          haltReports('one-to-many-error');
+          try{ await navLog(kit,{ area:'reports', step:'one-to-many-error', message: errInfo.text }); }catch(_e){}
+          try{ await chrome.storage.local.set({ gmReportsFiles: [] }); renderReportsFiles([]); refreshReportStatus(); updateBundleUi(); }catch(_e){}
+          // Save error to Atlas and load next item
+          try{
+            const ocnEl=document.getElementById('ocnInputReports');
+            let ocn = '';
+            try{ ocn=(ocnEl?.value||'').trim(); }catch(_e){}
+            if(!ocn){ try{ const s=await chrome.storage.local.get(['gmOcn']); ocn=(s?.gmOcn||'').trim(); }catch(_e){} }
+            const base=(await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT')).ATLAS_LEGACY_ENDPOINT || 'https://atlas.othram.com:8080/api';
+            const form=new FormData(); form.append('ocn', ocn); form.append('kit', kit); form.append('site','PRO'); form.append('status','error'); form.append('notes', errInfo.text||'');
+            const resp=await fetch(`${base}/atlas/legacy/save`, { method:'POST', body: form });
+            const data=await resp.json().catch(()=>({}));
+            if(resp.ok && data?.ok){
+              // auto-fill next and auto-run based on limit/delay
+              try{
+                try{ const nm=document.getElementById('noMoreKitsMsg'); if(nm) nm.classList.add('hidden'); }catch(_e){}
+                const r=await fetch(`${base}/atlas/legacy/next?site=PRO`, { credentials:'include' });
+                const j=await r.json().catch(()=>({}));
+                if(r.ok && j?.ok && j?.item){
+                  const { kit: nextKit, ocn: nextOcn }=j.item;
+                  // decrement remaining and read delay
+                  try{
+                    const limEl=document.getElementById('autoRunLimit');
+                    const delayEl=document.getElementById('autoRunDelay');
+                    autoRunState.remaining = Math.max(0, parseInt(limEl?.value||'0',10)||0);
+                    autoRunState.delaySec = Math.max(0, parseInt(delayEl?.value||'0',10)||0);
+                    if(autoRunState.remaining>0){ autoRunState.remaining -= 1; if(limEl){ limEl.value=String(autoRunState.remaining); } }
+                  }catch(_e){}
+                  // Fill next values
+                  try{ const kitEl=document.getElementById('oneToManyKit'); if(kitEl){ kitEl.value=nextKit||''; } }catch(_e){}
+                  try{ const ocnEl2=document.getElementById('ocnInputReports'); if(ocnEl2){ ocnEl2.value=nextOcn||''; await chrome.storage.local.set({ gmOcn: (nextOcn||'').trim() }); } }catch(_e){}
+                  // schedule next run if remaining>0 with countdown display
+                  try{
+                    if(autoRunState.remaining>0 && autoRunState.delaySec>0){
+                      // Show countdown timer
+                      const countdownEl = document.getElementById('autoRunCountdown');
+                      if(countdownEl) countdownEl.classList.remove('hidden');
+                      let secondsLeft = autoRunState.delaySec;
+                      const countdownInterval = setInterval(()=>{
+                        if(countdownEl) countdownEl.textContent = `Starting next run in ${secondsLeft} seconds...`;
+                        secondsLeft--;
+                        if(secondsLeft < 0){
+                          clearInterval(countdownInterval);
+                          if(countdownEl) countdownEl.classList.add('hidden');
+                          // Actually click the Run One-to-Many button
+                          const runBtn = document.getElementById('btnRunOneToMany');
+                          if(runBtn) runBtn.click();
+                        }
+                      }, 1000);
+                      // Show initial message immediately
+                      if(countdownEl) countdownEl.textContent = `Starting next run in ${secondsLeft} seconds...`;
+                    } else if(autoRunState.remaining>0){
+                      // No delay, run immediately
+                      setTimeout(()=>{
+                        const runBtn = document.getElementById('btnRunOneToMany');
+                        if(runBtn) runBtn.click();
+                      }, 100);
+                    }
+                  }catch(_e){}
+                } else {
+                  try{ const nm=document.getElementById('noMoreKitsMsg'); if(nm) nm.classList.remove('hidden'); }catch(_e){}
+                }
+              }catch(_e){}
+            }
+          }catch(_e){}
+          return; // hard stop
+        }
+      }catch(_e){}
+      // Click Download CSV button to generate the link
+      try{ ensureNotHalted();
+        await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
+          const dl=document.querySelector('button#edit-download-csv.js-form-submit');
+          if(dl){ dl.click(); return { clicked:true }; }
+          const alt=document.querySelector('input#edit-download-csv[type="submit"]');
+          if(alt){ alt.click(); return { clicked:true, alt:true }; }
+          return { clicked:false };
+        }});
+        try{ await navLog(kit,{ area:'reports', step:'one-to-many-download-clicked' }); }catch(_e){}
+        renderReportsLog();
+      } catch(e){ if(String(e?.message||'')!=='reports-halted'){ console.warn('Download button click failed', e); } }
+      await waitForTabComplete(tab.id, 30000);
+      // Find the generated link by text and fetch the CSV
+      try{ ensureNotHalted();
+        const execRes = await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
+          if(location.host.includes('auth.gedmatch.com') && location.pathname.includes('/u/login/identifier')){
+            return { ok:false, login:true };
+          }
+          const a=[...document.querySelectorAll('a')].find(x=> (x.textContent||'').trim()==='Click here to download file.');
+          if(!a) return { ok:false };
+          const href=a.getAttribute('href')||a.href||'';
+          const url = href && /^https?:/i.test(href) ? href : (href ? (new URL(href, location.origin)).toString() : '');
+          return { ok:Boolean(url), url, filename: (href||'').split('/').pop()||'' };
+        }});
+        const linkInfo = (execRes && execRes[0] && execRes[0].result) || null;
+        if(linkInfo && linkInfo.login){
+          haltReports('login-detected');
+          try{ await chrome.storage.local.set({ gmReportsFiles: [] }); renderReportsFiles([]); refreshReportStatus(); updateBundleUi(); }catch(_e){}
+          return;
+        }
+        try{ await navLog(kit,{ area:'reports', step:'one-to-many-link', ok: !!(linkInfo&&linkInfo.ok), url: linkInfo?.url||null, filename: linkInfo?.filename||null }); }catch(_e){}
+        if(linkInfo?.ok && linkInfo.url){
+          // Fetch the CSV in the extension context
+          const resp = await fetch(linkInfo.url, { credentials:'include' });
+          const blob = await resp.blob();
+          const buf = await blob.arrayBuffer();
+          const bytes = new Uint8Array(buf);
+          const fileRec = { name: linkInfo.filename || `one-to-many-${Date.now()}.csv`, data: Array.from(bytes), savedAt: new Date().toISOString(), sourceUrl: linkInfo.url, kind: 'one-to-many' };
+          const store = await chrome.storage.local.get(['gmReportsFiles']);
+          const files = Array.isArray(store.gmReportsFiles) ? store.gmReportsFiles : [];
+          files.unshift(fileRec);
+          await chrome.storage.local.set({ gmReportsFiles: files });
+          renderReportsFiles(files);
+          await refreshReportStatus();
+          await updateBundleUi();
+          try{ await navLog(kit,{ area:'reports', step:'one-to-many-fetched', bytes: bytes.length }); }catch(_e){}
+          renderReportsLog();
+          // Proceed to segment match flow: select all and open Visualization Options
+          try{
+            await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
+              const selAll=document.querySelector('input.form-checkbox[title="Select all rows in this table"]');
+              if(selAll){
+                if(!selAll.checked){ selAll.click(); selAll.checked=true; }
+                selAll.dispatchEvent(new Event('change', { bubbles:true }));
+                return { selected:true };
+              }
+              return { selected:false };
+            }});
+            try{ await navLog(kit,{ area:'reports', step:'select-all', selected:true }); }catch(_e){}
+            renderReportsLog();
+          }catch(e){ console.warn('Select-all failed', e); }
+          try{
+            await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
+              const vis=document.querySelector('#edit-multi-kit-analysis-submit');
+              if(vis){ vis.click(); return { clicked:true }; }
+              return { clicked:false };
+            }});
+            try{ await navLog(kit,{ area:'reports', step:'vis-options-click' }); }catch(_e){}
+            renderReportsLog();
+            console.log('[Reports] Visualization Options clicked');
+          }catch(e){ console.warn('Visualization Options click failed', e); }
+          await waitForTabComplete(tab.id, 30000);
+          // On the visualization page, click the Search button to run the segment report
+          try{
+            // Ask background to watch for child tab opened from this tab
+            try{ await new Promise(res=>chrome.runtime.sendMessage({ type:'gm:watchChildTabs', parentTabId: tab.id }, ()=>res())); }catch(_e){}
+            let clicked=false; let tries=0;
+            while(!clicked && tries++<5){
+              const exec = await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
+                const b1=document.querySelector('button#edit-submit--2.button.js-form-submit');
+                const b2=document.querySelector('button#edit-submit.button.js-form-submit');
+                const b3=document.querySelector('button[data-drupal-selector="edit-submit"].js-form-submit');
+                const btn=b1||b2||b3;
+                if(btn){ btn.click(); return { clicked:true }; }
+                const i1=document.querySelector('input#edit-submit--2[type="submit"]');
+                const i2=document.querySelector('input#edit-submit[type="submit"]');
+                const i3=document.querySelector('input[data-drupal-selector="edit-submit"][type="submit"]');
+                const alt=i1||i2||i3; if(alt){ alt.click(); return { clicked:true, alt:true }; }
+                return { clicked:false };
+              }});
+              clicked = !!(exec && exec[0] && exec[0].result && exec[0].result.clicked);
+              if(!clicked){ await new Promise(r=>setTimeout(r, 500)); }
+            }
+            try{ await navLog(kit,{ area:'reports', step:'segment-search-clicked' }); }catch(_e){}
+            renderReportsLog();
+            console.log('[Reports] Segment search clicked, waiting for results...');
+          }catch(e){ console.warn('Segment Search click failed', e); }
+          await waitForTabComplete(tab.id, 30000);
+          // Immediately adopt results tab if background stored it, and close the parent wrong tab
+          try{
+            const s=await chrome.storage.local.get(['gmSegmentResultsTabId']);
+            if(s.gmSegmentResultsTabId && s.gmSegmentResultsTabId!==tab.id){
+              console.log('[Reports] Adopting detected results tab:', s.gmSegmentResultsTabId, 'closing parent:', tab.id);
+              try{ await chrome.tabs.remove(tab.id); }catch(_e){}
+              tab.id = s.gmSegmentResultsTabId;
+            }
+          }catch(_e){}
+          // Prefer the currently active GEDmatch tab again after the search
+          try{ const activeId2=await getActiveGedmatchTabId(tab.id); if(activeId2!==tab.id){ console.log('[Reports] Using active GEDmatch tab after search:', activeId2); tab.id=activeId2; } }catch(_e){}
+          // Generate segment CSV link: NEW APPROACH - diagnose then act
+          console.log('[Reports] Diagnosing segment page...');
+          await new Promise(r=>setTimeout(r, 3000)); // Let AJAX settle
+          
+          try{
+            // Step 1: Diagnose what's on the page
+            const diagnosis = await chrome.scripting.executeScript({ 
+              target:{ tabId: tab.id }, 
+              func:()=>{
+                const btn = document.querySelector('#edit-download-csv');
+                const allButtons = [...document.querySelectorAll('button, input[type="submit"]')].map(b=>({
+                  id: b.id,
+                  text: b.textContent?.trim() || b.value,
+                  type: b.type,
+                  name: b.name
+                }));
+                
+                // Check if button exists and its properties
+                if(!btn) return { 
+                  buttonFound: false, 
+                  allButtons,
+                  pageHasDownloadText: document.body.textContent.includes('Download CSV')
+                };
+                
+                // Get computed styles to check visibility
+                const styles = window.getComputedStyle(btn);
+                const rect = btn.getBoundingClientRect();
+                
+                return {
+                  buttonFound: true,
+                  id: btn.id,
+                  name: btn.name,
+                  value: btn.value,
+                  type: btn.type,
+                  disabled: btn.disabled,
+                  visible: styles.display !== 'none' && styles.visibility !== 'hidden',
+                  inViewport: rect.top >= 0 && rect.bottom <= window.innerHeight,
+                  hasForm: !!btn.form,
+                  formAction: btn.form?.action,
+                  allButtons
+                };
+              }
+            });
+            
+            console.log('[Reports] Page diagnosis:', diagnosis[0]?.result);
+            
+            if(!diagnosis[0]?.result?.buttonFound){
+              console.error('[Reports] Download CSV button not found!');
+              console.log('[Reports] Buttons on page:', diagnosis[0]?.result?.allButtons);
+              return;
+            }
+            
+            // Step 2: Try the simplest approach - just submit the form with the button value
+            console.log('[Reports] Attempting form submission with button value...');
+            // New: perform POST in page context and parse response for CSV link (handle HTML or Drupal AJAX JSON)
+            try{
+              const submitInfoArr = await chrome.scripting.executeScript({ target:{ tabId: tab.id }, func: async ()=>{
+                try{
+                  const btn=document.querySelector('#edit-download-csv, [data-drupal-selector="edit-download-csv"]');
+                  const form=btn?.form || btn?.closest('form');
+                  if(!form) return { ok:false, error:'no-form' };
+                  const fd=new FormData(form);
+                  fd.set(btn.name||'op', btn.value||'Download CSV');
+                  const action=form.action||location.href;
+                  const resp=await fetch(action, { method:'POST', body: fd, credentials:'include' });
+                  const text=await resp.text();
+                  let link='';
+                  // Try Drupal AJAX JSON
+                  try{
+                    const json=JSON.parse(text);
+                    if(Array.isArray(json)){
+                      for(const cmd of json){
+                        const command=(cmd?.command||'').toLowerCase();
+                        if(command==='insert'){
+                          const html = cmd?.data?.markup || cmd?.data || '';
+                          if(typeof html==='string'){
+                            const m = html.match(/href\s*=\s*"([^"]+\.csv[^"]*)"/i);
+                            if(m){ link = new URL(m[1], location.origin).toString(); break; }
+                          }
+                        }
+                      }
+                    }
+                  }catch(_e){}
+                  // Fallback: parse as full HTML
+                  if(!link){
+                    try{
+                      const doc=new DOMParser().parseFromString(text, 'text/html');
+                      const a1=[...doc.querySelectorAll('a')].find(a=>(a.textContent||'').trim()==='Click here to download file.');
+                      const a2=a1 || [...doc.querySelectorAll('a[href]')].find(a=>/\.csv(\?|$)/i.test(a.getAttribute('href')||a.href||''));
+                      if(a2){ const href=a2.getAttribute('href')||a2.href||''; link = href && /^https?:/i.test(href) ? href : (href ? (new URL(href, location.origin).toString()) : ''); }
+                    }catch(_e){}
+                  }
+                  return { ok:Boolean(link), link, action, submitted:true };
+                }catch(e){ return { ok:false, error:String(e) }; }
+              }});
+              const submitInfo = submitInfoArr && submitInfoArr[0] && submitInfoArr[0].result;
+              if(submitInfo?.ok && submitInfo.link){
+                console.log('[Reports] Extracted segment link from POST response:', submitInfo.link);
+                const resp = await fetch(submitInfo.link, { credentials:'include' });
+                const blob = await resp.blob();
+                const buf = await blob.arrayBuffer();
+                const bytes = new Uint8Array(buf);
+                const name = submitInfo.link.split('/').pop() || `segments-${Date.now()}.csv`;
+                const store = await chrome.storage.local.get(['gmReportsFiles']);
+                const files = Array.isArray(store.gmReportsFiles) ? store.gmReportsFiles : [];
+                files.unshift({ name, data: Array.from(bytes), savedAt: new Date().toISOString(), sourceUrl: submitInfo.link, kind: 'segments' });
+                await chrome.storage.local.set({ gmReportsFiles: files });
+                renderReportsFiles(files);
+                await refreshReportStatus();
+                await updateBundleUi();
+                // Auto-run Auto-Kinship now that segments CSV is saved
+                try{
+                  const kitVal=(document.getElementById('oneToManyKit')?.value||'').trim();
+                  if(kitVal){ runAutoKinshipFlow(kitVal).catch(()=>{}); }
+                }catch(_e){}
+                try{ await navLog(kit,{ area:'reports', step:'segments-fetched', filename:name, bytes: bytes.length }); }catch(_e){}
+                renderReportsLog();
+                return; // Done
+              }
+            }catch(e){ console.warn('POST-parse extraction failed', e); }
+          }catch(e){ 
+            console.error('[Reports] Segment download failed:', e); 
+            await navLog(kit,{ area:'reports', step:'segment-download-error', error:String(e) });
+          }
+          // Allow AJAX to finish rendering link (no full navigation)
+          await new Promise(r=>setTimeout(r, 2000));
+        } else {
+          if(!reportsHalted){ alert('Download link not found.'); }
+        }
+      } catch(e){ console.error('Fetch CSV failed', e); if(String(e?.message||'')!=='reports-halted'){ alert('Failed to fetch CSV: '+String(e?.message||e)); } }
+    };
+  }
+
+  // Load next pending (Atlas Legacy) — fills Kit and OCN inputs only
+  (function setupLoadNext(){
+    const btn=document.getElementById('btnLoadNextAtlas');
+    if(!btn) return;
+    btn.addEventListener('click', async ()=>{
+      try{
+        // Read base endpoint from storage; default localhost
+        const base=(await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT')).ATLAS_LEGACY_ENDPOINT || 'https://atlas.othram.com:8080/api';
+        const resp=await fetch(`${base}/atlas/legacy/next?site=PRO`, { credentials:'include' });
+        const data=await resp.json().catch(()=>({}));
+        if(!resp.ok || !data?.ok || !data?.item){ alert('No pending legacy items.'); return; }
+        const { kit, ocn } = data.item;
+        try{ const kitEl=document.getElementById('oneToManyKit'); if(kitEl){ kitEl.value=kit||''; } }catch(_e){}
+        try{ const ocnEl=document.getElementById('ocnInputReports'); if(ocnEl){ ocnEl.value=ocn||''; await chrome.storage.local.set({ gmOcn: (ocn||'').trim() }); } }catch(_e){}
+      }catch(e){ alert('Failed to load next from Atlas: '+String(e?.message||e)); }
+    });
+  })();
+
+  function renderReportsFiles(files){
+    const el=document.getElementById('reportsFiles'); if(!el) return;
+    el.innerHTML='';
+    const list=Array.isArray(files)?files:[];
+    for(const f of list){
+      const item=document.createElement('div');
+      const name=document.createElement('span'); name.textContent=f.name||'report'; name.className='muted';
+      const btn=document.createElement('button'); btn.className='btn btn-link'; btn.textContent='Download';
+      btn.onclick=async ()=>{
+        try{
+          if(f.url){
+            // Remote URL (e.g., S3 pre-signed)
+            await chrome.downloads.download({ url: f.url, filename: f.name||'report.zip', saveAs:true });
+            return;
+          }
+          const bytes=new Uint8Array(f.data||[]);
+          const mime=f.mime||(/\.zip$/i.test(f.name||'')?'application/zip':'text/csv');
+          const blob=new Blob([bytes], { type: mime });
+          const url=URL.createObjectURL(blob);
+          await chrome.downloads.download({ url, filename:f.name||'report.csv', saveAs:true });
+          setTimeout(()=>URL.revokeObjectURL(url), 10000);
+        }catch(e){ alert('Download failed: '+String(e?.message||e)); }
+      };
+      const btnDel=document.createElement('button'); btnDel.className='btn btn-link'; btnDel.title='Delete'; btnDel.textContent='🗑️';
+      btnDel.onclick=async ()=>{
+        try{
+          const store=await chrome.storage.local.get(['gmReportsFiles']);
+          const arr=Array.isArray(store.gmReportsFiles)?store.gmReportsFiles:[];
+          const idx=arr.findIndex(x=>x && x.name===f.name && x.savedAt===f.savedAt && x.sourceUrl===f.sourceUrl);
+          if(idx>=0){ arr.splice(idx,1); await chrome.storage.local.set({ gmReportsFiles: arr }); renderReportsFiles(arr); refreshReportStatus(); }
+        }catch(e){ alert('Delete failed: '+String(e?.message||e)); }
+      };
+      item.appendChild(name); item.appendChild(document.createTextNode(' ')); item.appendChild(btn);
+      item.appendChild(document.createTextNode(' ')); item.appendChild(btnDel);
+      el.appendChild(item);
+    }
+  }
+  async function renderReportsLog(){
+    const el=document.getElementById('reportsLog'); if(!el) return;
+    try{
+      const store=await chrome.storage.local.get(['gmLogsByKit','gmFocusedKit']);
+      let kit=store.gmFocusedKit||null; const logs=store.gmLogsByKit||{};
+      if(!kit){
+        // Fallback: use current one-to-many kit input
+        try{ const k=document.getElementById('oneToManyKit')?.value?.trim(); if(k) kit=k; }catch(_e){}
+      }
+      const arr=kit? (logs[kit]||[]) : [];
+      const reportLogs=arr.filter(x=>x?.area==='reports');
+      el.textContent = reportLogs.map(l=>{
+        const t=l.t||new Date().toISOString(); const step=l.step||''; const extra=JSON.stringify(Object.fromEntries(Object.entries(l).filter(([k])=>!['t','area','step'].includes(k))));
+        return `${t}  ${step}  ${extra}`;
+      }).join('\n');
+    }catch(_e){ el.textContent='(no logs)'; }
+  }
+  // Render any saved files on load
+  try{ const store=await chrome.storage.local.get(['gmReportsFiles']); renderReportsFiles(store.gmReportsFiles||[]); refreshReportStatus(); updateBundleUi(); } catch(_e){}
+  // Render logs now and refresh periodically while Reports tab is visible
+  renderReportsLog();
+  setInterval(()=>{
+    const panel=document.getElementById('panelReports');
+    if(panel && !panel.classList.contains('hidden')){ renderReportsLog(); updateBundleUi(); }
+  }, 1500);
+
+  // Resolve the actual results tab after a form submission that may open a new tab
+  async function resolveSegmentResultsTab(originalTabId){
+    const deadline=Date.now()+15000;
+    let lastCheckedTabId=originalTabId;
+    while(Date.now()<deadline){
+      try{
+        // First, check the original tab for the expected controls
+        const res = await chrome.scripting.executeScript({ target:{ tabId: originalTabId }, func:()=>{
+          const hasSegmentControls = !!document.querySelector('#edit-download-csv') || !!document.querySelector('input[type="submit"][value="Match CSV file"]') || !!document.querySelector('input[type="submit"][value*="Segment CSV"]');
+          return { ok: hasSegmentControls, href: location.href };
+        }});
+        if(res && res[0] && res[0].result && res[0].result.ok){ return originalTabId; }
+      }catch(_e){}
+      try{
+        // Next, check the active tab in the last-focused browser window (not the side panel)
+        let active = null;
+        try{ const win=await chrome.windows.getLastFocused({ populate:true }); if(win && Array.isArray(win.tabs)){ active = win.tabs.find(t=>t.active) || null; } }catch(_e){}
+        if(!active){ const activeArr = await chrome.tabs.query({ active:true, lastFocusedWindow:true }); active = activeArr && activeArr[0]; }
+        if(active && active.id!==lastCheckedTabId && /gedmatch\.com/i.test(active.url||'')){
+          const ra = await chrome.scripting.executeScript({ target:{ tabId: active.id }, func:()=>{
+            const hasSegmentControls = !!document.querySelector('#edit-download-csv') || !!document.querySelector('input[type="submit"][value="Match CSV file"]') || !!document.querySelector('input[type="submit"][value*="Segment CSV"]');
+            return { ok: hasSegmentControls, href: location.href };
+          }});
+          if(ra && ra[0] && ra[0].result && ra[0].result.ok){ return active.id; }
+          lastCheckedTabId = active.id;
+        }
+      }catch(_e){}
+      try{
+        // Finally, scan all tabs that belong to gedmatch and check quickly
+        const tabs = await chrome.tabs.query({});
+        const candidates = tabs.filter(t=>/gedmatch\.com/i.test(t.url||''));
+        for(const t of candidates){
+          const rr = await chrome.scripting.executeScript({ target:{ tabId: t.id }, func:()=>{
+            const hasSegmentControls = !!document.querySelector('#edit-download-csv') || !!document.querySelector('input[type="submit"][value="Match CSV file"]') || !!document.querySelector('input[type="submit"][value*="Segment CSV"]');
+            return { ok: hasSegmentControls, href: location.href };
+          }});
+          if(rr && rr[0] && rr[0].result && rr[0].result.ok){ return t.id; }
+        }
+      }catch(_e){}
+      await new Promise(r=>setTimeout(r, 500));
+    }
+    return originalTabId;
+  }
+
+  // Always prefer the currently focused GEDmatch tab after navigations
+  async function getActiveGedmatchTabId(fallbackId){
+    try{
+      const win=await chrome.windows.getLastFocused({ populate:true });
+      if(win && Array.isArray(win.tabs)){
+        const t = win.tabs.find(tb=>tb.active && /gedmatch\.com/i.test(tb.url||''));
+        if(t) return t.id;
+      }
+    }catch(_e){}
+    try{
+      const arr=await chrome.tabs.query({ active:true, lastFocusedWindow:true });
+      const t=arr && arr.find(tb=>/gedmatch\.com/i.test(tb.url||''));
+      if(t) return t.id;
+    }catch(_e){}
+    try{
+      const arr=await chrome.tabs.query({ active:true });
+      const t=arr && arr.find(tb=>/gedmatch\.com/i.test(tb.url||''));
+      if(t) return t.id;
+    }catch(_e){}
+    return fallbackId;
+  }
+
+  async function findSegmentResultsTabId(){
+    try{ const s=await chrome.storage.local.get(['gmSegmentResultsTabId']); if(s.gmSegmentResultsTabId) return s.gmSegmentResultsTabId; }catch(_e){}
+    try{ const tabs=await chrome.tabs.query({ url: 'https://pro.gedmatch.com/tools/multi-kit-analysis/segment-search*' }); if(Array.isArray(tabs)&&tabs.length){ const active=tabs.find(t=>t.active); return (active||tabs[0]).id; } }catch(_e){}
+    try{ const tabs=await chrome.tabs.query({}); const c=tabs.filter(t=>/pro\.gedmatch\.com\/tools\/multi-kit-analysis\/segment-search/i.test(t.url||'')); if(c.length){ const active=c.find(t=>t.active); return (active||c[0]).id; } }catch(_e){}
+    try{ const tabs=await chrome.tabs.query({ url: 'https://pro.gedmatch.com/*' }); for(const t of tabs){ try{ const res=await chrome.scripting.executeScript({ target:{ tabId: t.id }, func:()=>{ const has = document.querySelector('#edit-download-csv') || document.querySelector('input[type="submit"][value="Match CSV file"]') || document.querySelector('input[type="submit"][value*="Segment CSV"]'); return !!has; } }); if(res && res[0] && res[0].result){ return t.id; } }catch(_e){} } }catch(_e){}
+    return null;
+  }
+
+  // Perform a physical click using DevTools Protocol (requires debugger permission)
+  async function physicalClickViaDebugger(tabId, selector){
+    try{
+      // Focus the window/tab to ensure events land
+      try{ const t=await chrome.tabs.get(tabId); if(t?.windowId){ await chrome.windows.update(t.windowId, { focused:true }); } await chrome.tabs.update(tabId, { active:true }); }catch(_e){}
+      // Compute coordinates of target element
+      const posRes = await chrome.scripting.executeScript({ target:{ tabId }, func:(sel)=>{
+        const el = document.querySelector(sel);
+        if(!el) return { ok:false };
+        try{ el.scrollIntoView({ block:'center' }); }catch(_e){}
+        const r = el.getBoundingClientRect();
+        const x = Math.floor(r.left + (r.width/2));
+        const y = Math.floor(r.top + (r.height/2));
+        return { ok:true, x, y };
+      }, args:[selector] });
+      const pos = posRes && posRes[0] && posRes[0].result;
+      if(!pos?.ok) return false;
+
+      // Attach debugger
+      await new Promise((resolve, reject)=>{
+        chrome.debugger.attach({ tabId }, '1.3', ()=>{
+          if(chrome.runtime.lastError){ reject(new Error(chrome.runtime.lastError.message)); return; }
+          resolve();
+        });
+      });
+
+      const send = (method, params)=>new Promise((resolve,reject)=>{
+        chrome.debugger.sendCommand({ tabId }, method, params, (res)=>{
+          if(chrome.runtime.lastError){ reject(new Error(chrome.runtime.lastError.message)); return; }
+          resolve(res);
+        });
+      });
+
+      await send('Input.dispatchMouseEvent', { type:'mouseMoved', x: pos.x, y: pos.y, button:'none' });
+      await send('Input.dispatchMouseEvent', { type:'mousePressed', x: pos.x, y: pos.y, button:'left', clickCount: 1 });
+      await send('Input.dispatchMouseEvent', { type:'mouseReleased', x: pos.x, y: pos.y, button:'left', clickCount: 1 });
+
+      // Detach debugger
+      try{ await new Promise((resolve)=>{ chrome.debugger.detach({ tabId }, ()=>resolve()); }); }catch(_e){}
+      return true;
+    }catch(e){
+      try{ await new Promise((resolve)=>{ chrome.debugger.detach({ tabId }, ()=>resolve()); }); }catch(_e){}
+      return false;
+    }
+  }
+
+  function setReportStatus(which, ok){
+    const id = which==='one' ? 'statusOneToMany' : which==='seg' ? 'statusSegments' : 'statusAutoKinship';
+    const el=document.getElementById(id); if(!el) return;
+    const dot=el.querySelector('.dot'); if(!dot) return;
+    dot.classList.remove('red','yellow','green');
+    dot.classList.add(ok ? 'green' : 'red');
+  }
+  async function refreshReportStatus(){
+    try{
+      const store=await chrome.storage.local.get(['gmReportsFiles']);
+      const files=Array.isArray(store.gmReportsFiles)?store.gmReportsFiles:[];
+      // Clear any login warning by default
+      try{ const lw=document.getElementById('loginWarning'); if(lw) lw.classList.add('hidden'); }catch(_e){}
+      const classify = (f)=>{
+        if(f?.kind==='one-to-many') return 'one';
+        if(f?.kind==='segments') return 'seg';
+        if(f?.kind==='autokinship') return 'ak';
+        const name=(f?.name||'').toLowerCase();
+        if(/one-to-many/.test(name)) return 'one';
+        if(/segment|match/.test(name)) return 'seg';
+        if(/autokinship|\.zip$/.test(name)) return 'ak';
+        // Heuristic: peek header
+        try{
+          const bytes=new Uint8Array(f?.data||[]);
+          const text=new TextDecoder('utf-8').decode(bytes.slice(0, 2048));
+          if(/\bKit\b,\s*Name\b.*GED WikiTree/i.test(text)) return 'one';
+          if(/\bPrimaryKit\b|\bMatchedKit\b|\bSegment cM\b/i.test(text)) return 'seg';
+        }catch(_e){}
+        return null;
+      };
+      let hasOne=false, hasSeg=false, hasAk=false;
+      for(const f of files){ const k=classify(f); if(k==='one') hasOne=true; else if(k==='seg') hasSeg=true; else if(k==='ak') hasAk=true; }
+      setReportStatus('one', hasOne);
+      setReportStatus('seg', hasSeg);
+      setReportStatus('ak', hasAk);
+      // Enable Auto-Kinship if both are present
+      try{ const btn=document.getElementById('btnRunAutoKinship'); if(btn){ btn.disabled = !(hasOne && hasSeg); } }catch(_e){}
+    }catch(_e){}
+  }
+  // Auto-Kinship flow shared function
+  async function runAutoKinshipFlow(kit){
+    if(!kit) return;
+    // Gate on both CSVs present
+    try{
+      const store=await chrome.storage.local.get(['gmReportsFiles']);
+      const files=Array.isArray(store.gmReportsFiles)?store.gmReportsFiles:[];
+      const hasOne=files.some(f=>f?.kind==='one-to-many' || /one-to-many/i.test(f?.name||''));
+      const hasSeg=files.some(f=>f?.kind==='segments' || /segment|match/i.test(f?.name||''));
+      if(!(hasOne && hasSeg)) return;
+      // Skip if we already have autokinship
+      const hasAk=files.some(f=>f?.kind==='autokinship' || /autokinship|\.zip$/i.test(f?.name||''));
+      if(hasAk) return;
+    }catch(_e){}
+    try{ await navLog(kit,{ area:'reports', step:'open-auto-kinship' }); }catch(_e){}
+    const url='https://pro.gedmatch.com/tools/auto-kinship';
+    const tab=await chrome.tabs.create({ url, active:true });
+    // Detect login redirect and surface warning
+    try{
+      chrome.tabs.onUpdated.addListener(function onUpd(id, info, t){
+        if(id!==tab.id || !info.url) return;
+        if(/https:\/\/auth\.gedmatch\.com\/u\/login\/identifier/i.test(info.url)){
+          try{ const lw=document.getElementById('loginWarning'); if(lw) lw.classList.remove('hidden'); }catch(_e){}
+          chrome.tabs.onUpdated.removeListener(onUpd);
+        }
+      });
+    }catch(_e){}
+    await waitForTabComplete(tab.id, 30000);
+    // Fill kit and submit
+    try{
+      await chrome.scripting.executeScript({ target:{ tabId: tab.id }, func:(K)=>{
+        const input=document.querySelector('[data-drupal-selector="edit-kit1"]')||document.getElementById('edit-kit1');
+        if(input){ input.focus(); input.value=K; input.dispatchEvent(new Event('input',{bubbles:true})); }
+        const btn=document.querySelector('[data-drupal-selector="edit-submit"]')||document.getElementById('edit-submit');
+        if(btn){ btn.click(); return { ok:true, clicked:true }; }
+        // Fallback submit
+        const form=input?.form || document.querySelector('form[action*="auto-kinship"]');
+        if(form){ form.requestSubmit?.(); form.submit?.(); return { ok:true, submitted:true }; }
+        return { ok:false };
+      }, args:[kit] });
+      try{ await navLog(kit,{ area:'reports', step:'auto-kinship-submitted' }); }catch(_e){}
+    }catch(e){ console.warn('Auto-Kinship submit failed', e); }
+    // Wait a while for next page to load
+    await waitForTabComplete(tab.id, 60000);
+    // Poll for the Download Results link (can take up to ~1 minute)
+    try{ await navLog(kit,{ area:'reports', step:'auto-kinship-waiting' }); }catch(_e){}
+    const deadline = Date.now() + 120000;
+    let linkUrl = null;
+    while(Date.now() < deadline){
+      try{
+        const res = await chrome.scripting.executeScript({ target:{ tabId: tab.id }, func:()=>{
+          // If redirected to login, signal to panel
+          if(location.host.includes('auth.gedmatch.com') && location.pathname.includes('/u/login/identifier')){
+            return { ok:false, login:true };
+          }
+          const as=[...document.querySelectorAll('a[href]')];
+          // Prefer anchors that directly point to .zip
+          const zip = as.map(a=>a.getAttribute('href')||a.href||'').find(h=>/\.zip(\?|$)/i.test(h||''));
+          if(zip){
+            const url = /^https?:/i.test(zip) ? zip : (new URL(zip, location.origin)).toString();
+            return { ok:true, url };
+          }
+          // As a fallback, if a Download Results link exists but not a .zip yet, do not return it; keep waiting
+          return { ok:false };
+        }});
+        const info = res && res[0] && res[0].result;
+        if(info && info.login){
+          try{ const lw=document.getElementById('loginWarning'); if(lw) lw.classList.remove('hidden'); }catch(_e){}
+          break;
+        }
+        if(info && info.ok && info.url){ linkUrl = info.url; break; }
+      }catch(_e){}
+      // Nudge the page by clicking the visible Download Results button if present
+      try{
+        await chrome.scripting.executeScript({ target:{ tabId: tab.id }, func:()=>{
+          const btn=[...document.querySelectorAll('a,button')].find(el=>/download results/i.test((el.textContent||'').trim()));
+          if(btn){ try{ btn.click(); }catch(_){} }
+        }});
+      }catch(_e){}
+      await new Promise(r=>setTimeout(r, 2500));
+    }
+    if(linkUrl){
+      try{ await navLog(kit,{ area:'reports', step:'auto-kinship-link-found', url: linkUrl }); }catch(_e){}
+      
+      // Download the ZIP bytes by injecting a script into the GEDmatch page
+      try{
+        const store=await chrome.storage.local.get(['gmReportsFiles']);
+        const files=Array.isArray(store.gmReportsFiles)?store.gmReportsFiles:[];
+        const name=(()=>{ try{ const p=new URL(linkUrl); const base=p.pathname.split('/').pop()||''; return base||`AutoKinship-${Date.now()}.zip`; }catch(_){ return `AutoKinship-${Date.now()}.zip`; } })();
+        
+      // Store as URL (S3 pre-signed) and show in Reports list
+      files.unshift({ name, url: linkUrl, savedAt: new Date().toISOString(), sourceUrl: linkUrl, kind: 'autokinship', mime: 'application/zip' });
+        
+        await chrome.storage.local.set({ gmReportsFiles: files });
+        renderReportsFiles(files);
+        await refreshReportStatus();
+        await updateBundleUi();
+        try{ await navLog(kit,{ area:'reports', step:'auto-kinship-saved', name }); }catch(_e){}
+      }catch(e){ console.warn('Auto-Kinship save failed', e); }
+    } else {
+      // If we hit login anywhere along the way, clear report files to force a clean retry
+      try{
+        const s=await chrome.storage.local.get(['gmReportsFiles']);
+        if(Array.isArray(s.gmReportsFiles) && s.gmReportsFiles.length){ await chrome.storage.local.set({ gmReportsFiles: [] }); renderReportsFiles([]); refreshReportStatus(); updateBundleUi(); }
+      }catch(_e){}
+      try{ await navLog(kit,{ area:'reports', step:'auto-kinship-timeout' }); }catch(_e){}
+    }
+    renderReportsLog();
+  }
+
+  // Wire Auto-Kinship button
+  (function setupAutoKinship(){
+    const btn=document.getElementById('btnRunAutoKinship');
+    const kitInput=document.getElementById('oneToManyKit');
+    if(!btn||!kitInput) return;
+    btn.addEventListener('click', async ()=>{
+      const kit=(kitInput.value||'').trim(); if(!kit){ alert('Enter a Kit ID first.'); return; }
+      await runAutoKinshipFlow(kit);
+    });
+  })();
+
+  // Build bundle in memory and return { blob, filename }
+  async function buildBundleZip(){
+    const kit=(document.getElementById('oneToManyKit')?.value||'').trim(); if(!kit) throw new Error('Kit missing');
+    const store = await chrome.storage.local.get(['gmReportsFiles','gmOcn']);
+    const all = Array.isArray(store.gmReportsFiles)?store.gmReportsFiles:[];
+    const latest = (pred)=> all.find(f=>pred(f));
+    const isOne =(f)=> f?.kind==='one-to-many' || /one-to-many/i.test(f?.name||'');
+    const isSeg =(f)=> f?.kind==='segments' || /segment|match/i.test((f?.name||''));
+    const isAk  =(f)=> f?.kind==='autokinship' || /autokinship|\.zip$/i.test((f?.name||''));
+    const one = latest(isOne); const seg = latest(isSeg); const ak = latest(isAk);
+    if(!(one && seg && ak)) throw new Error('Bundle not ready');
+    const enc = new TextEncoder(); const files=[];
+    if(one?.data) files.push({ name: one.name||'one-to-many.csv', data:new Uint8Array(one.data) });
+    if(seg?.data) files.push({ name: seg.name||'segments.csv', data:new Uint8Array(seg.data) });
+    
+    // For Auto-Kinship: try to fetch if we have URL, fallback to data, or include URL text file
+    let akAdded=false;
+    // Try with data first if available
+    if(ak?.data) { 
+      files.push({ name: (ak.name||'AutoKinship.zip').replace(/\?.*$/,''), data:new Uint8Array(ak.data) }); 
+      akAdded=true; 
+    }
+    // If no data, try to fetch the URL (S3 presigned URLs don't need credentials)
+    if(!akAdded && ak?.url){ 
+      try{ 
+        // Don't use credentials for S3 URLs - they're presigned
+        const r=await fetch(ak.url); 
+        const ok = r?.ok && (/zip/i.test(r.headers.get('content-type')||'') || /\.zip(\?|$)/i.test(ak.url)); 
+        if(ok){ 
+          const b=new Uint8Array(await (await r.blob()).arrayBuffer()); 
+          files.push({ name:(ak.name||'AutoKinship.zip').replace(/\?.*$/,''), data:b }); 
+          akAdded=true; 
+        } 
+      }catch(_e){
+        console.warn('Failed to fetch Auto-Kinship ZIP from URL:', _e);
+      } 
+    }
+    // Last resort: include URL as text file
+    if(!akAdded && ak?.url){ 
+      files.push({ name:'AutoKinship_URL.txt', data: enc.encode(ak.url) }); 
+    }
+    if(!files.length) throw new Error('No files');
+    function dosDateTime(dt){ const d=dt||new Date(); const time=(d.getHours()<<11)|(d.getMinutes()<<5)|((d.getSeconds()/2)|0); const date=((d.getFullYear()-1980)<<9)|((d.getMonth()+1)<<5)|d.getDate(); return {time,date}; }
+    const CRC32_TABLE=(function(){ const t=new Uint32Array(256); for(let n=0;n<256;n++){ let c=n; for(let k=0;k<8;k++){ c=(c&1)?(0xEDB88320^(c>>>1)):(c>>>1);} t[n]=c>>>0; } return t; })();
+    function crc32Of(bytes){ let crc=0^0xFFFFFFFF; for(let i=0;i<bytes.length;i++){ crc=CRC32_TABLE[(crc^bytes[i])&0xFF]^(crc>>>8);} return (crc^0xFFFFFFFF)>>>0; }
+    const parts=[]; const centrals=[]; let offset=0;
+    for(const f of files){ const {time,date}=dosDateTime(new Date()); const nameBytes=enc.encode(f.name); const crc=crc32Of(f.data); const lh=new Uint8Array(30+nameBytes.length); const dv=new DataView(lh.buffer); dv.setUint32(0,0x04034b50,true); dv.setUint16(4,20,true); dv.setUint16(6,0,true); dv.setUint16(8,0,true); dv.setUint16(10,time,true); dv.setUint16(12,date,true); dv.setUint32(14,crc,true); dv.setUint32(18,f.data.length,true); dv.setUint32(22,f.data.length,true); dv.setUint16(26,nameBytes.length,true); dv.setUint16(28,0,true); lh.set(nameBytes,30); parts.push(lh, f.data); const ch=new Uint8Array(46+nameBytes.length); const dv2=new DataView(ch.buffer); dv2.setUint32(0,0x02014b50,true); dv2.setUint16(4,20,true); dv2.setUint16(6,20,true); dv2.setUint16(8,0,true); dv2.setUint16(10,0,true); dv2.setUint16(12,time,true); dv2.setUint16(14,date,true); dv2.setUint32(16,crc,true); dv2.setUint32(20,f.data.length,true); dv2.setUint32(24,f.data.length,true); dv2.setUint16(28,nameBytes.length,true); dv2.setUint16(30,0,true); dv2.setUint16(32,0,true); dv2.setUint16(34,0,true); dv2.setUint16(36,0,true); dv2.setUint32(38,0,true); dv2.setUint32(42,offset,true); ch.set(nameBytes,46); centrals.push(ch); offset += lh.length + f.data.length; }
+    const centralSize=centrals.reduce((a,b)=>a+b.length,0); const eocd=new Uint8Array(22); const dv3=new DataView(eocd.buffer); dv3.setUint32(0,0x06054b50,true); dv3.setUint16(4,0,true); dv3.setUint16(6,0,true); dv3.setUint16(8,files.length,true); dv3.setUint16(10,files.length,true); dv3.setUint32(12,centralSize,true); dv3.setUint32(16,offset,true); dv3.setUint16(20,0,true);
+    const blob=new Blob([...parts, ...centrals, eocd], { type:'application/zip' });
+    const d=new Date(); const m=d.getMonth()+1; const day=d.getDate(); const yyyy=d.getFullYear(); const ocn=(store?.gmOcn||'').trim(); const prefix=ocn?`${ocn}_`:''; const filename=`${prefix}${kit}_gmp_${m}-${day}-${yyyy}.zip`;
+    return { blob, filename };
+  }
+
+  // Build bundle in memory on demand and download
+  async function downloadBundleNow(){
+    try{
+      const { blob, filename } = await buildBundleZip();
+      const url=URL.createObjectURL(blob);
+      await chrome.downloads.download({ url, filename, saveAs:true }); 
+      setTimeout(()=>URL.revokeObjectURL(url), 10000);
+    }catch(e){ 
+      alert('Bundle build failed: '+String(e?.message||e)); 
+    }
+  }
+
+  async function updateBundleUi(){
+    try{
+      const kit=(document.getElementById('oneToManyKit')?.value||'').trim();
+      const status=document.getElementById('bundleStatus');
+      const btn=document.getElementById('btnDownloadBundle');
+      const btnSave=document.getElementById('btnSaveToAtlas');
+      if(!status||!btn) return;
+      const store=await chrome.storage.local.get(['gmReportsFiles','gmOcn']);
+      const files=Array.isArray(store.gmReportsFiles)?store.gmReportsFiles:[];
+      const hasOne = files.some(f=>f?.kind==='one-to-many' || /one-to-many/i.test(f?.name||''));
+      const hasSeg = files.some(f=>f?.kind==='segments' || /segment|match/i.test(f?.name||''));
+      const hasAk  = files.some(f=>f?.kind==='autokinship' || /autokinship|\.zip$/i.test(f?.name||''));
+      if(hasOne && hasSeg && hasAk){
+        const d=new Date(); const m=d.getMonth()+1; const day=d.getDate(); const yyyy=d.getFullYear(); const ocn=(store?.gmOcn||'').trim(); const prefix=ocn?`${ocn}_`:''; const fname=kit?`${prefix}${kit}_gmp_${m}-${day}-${yyyy}.zip`:'bundle.zip';
+        status.textContent = `Ready: ${fname}`;
+        btn.disabled=false;
+        btn.onclick = downloadBundleNow;
+        if(btnSave){ btnSave.disabled=false; btnSave.onclick = async ()=>{
+          try{
+            const base = (await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT')).ATLAS_LEGACY_ENDPOINT || 'http://localhost:3005';
+            const { blob, filename } = await buildBundleZip();
+            const form=new FormData();
+            form.append('ocn', ocn);
+            form.append('kit', kit);
+            form.append('site', 'PRO');
+            form.append('status', 'success');
+            form.append('file', blob, filename);
+            const res = await fetch(`${base}/atlas/legacy/save`, { 
+              method:'POST', 
+              body: form 
+            });
+            const data = await res.json().catch(()=>({}));
+            if(res.ok && data?.ok){
+              // Success: silently proceed to load the next kit and auto-run based on limit/delay
+              try{
+                // Hide any previous message
+                try{ const nm=document.getElementById('noMoreKitsMsg'); if(nm) nm.classList.add('hidden'); }catch(_e){}
+                const r=await fetch(`${base}/atlas/legacy/next?site=PRO`, { credentials:'include' });
+                const j=await r.json().catch(()=>({}));
+                if(r.ok && j?.ok && j?.item){
+                  const { kit: nextKit, ocn: nextOcn }=j.item;
+                  // decrement remaining and read delay
+                  try{
+                    const limEl=document.getElementById('autoRunLimit');
+                    const delayEl=document.getElementById('autoRunDelay');
+                    autoRunState.remaining = Math.max(0, parseInt(limEl?.value||'0',10)||0);
+                    autoRunState.delaySec = Math.max(0, parseInt(delayEl?.value||'0',10)||0);
+                    if(autoRunState.remaining>0){ autoRunState.remaining -= 1; if(limEl){ limEl.value=String(autoRunState.remaining); } }
+                  }catch(_e){}
+                  // Fill next values
+                  try{ const kitEl=document.getElementById('oneToManyKit'); if(kitEl){ kitEl.value=nextKit||''; } }catch(_e){}
+                  try{ const ocnEl=document.getElementById('ocnInputReports'); if(ocnEl){ ocnEl.value=nextOcn||''; await chrome.storage.local.set({ gmOcn: (nextOcn||'').trim() }); } }catch(_e){}
+                  // Clear previous files before starting next run
+                  try{ await chrome.storage.local.set({ gmReportsFiles: [] }); renderReportsFiles([]); refreshReportStatus(); updateBundleUi(); }catch(_e){}
+                  // schedule next run if remaining>0 with countdown display
+                  try{
+                    if(autoRunState.remaining>0 && autoRunState.delaySec>0){
+                      // Show countdown timer
+                      const countdownEl = document.getElementById('autoRunCountdown');
+                      if(countdownEl) countdownEl.classList.remove('hidden');
+                      let secondsLeft = autoRunState.delaySec;
+                      const countdownInterval = setInterval(()=>{
+                        if(countdownEl) countdownEl.textContent = `Starting next run in ${secondsLeft} seconds...`;
+                        secondsLeft--;
+                        if(secondsLeft < 0){
+                          clearInterval(countdownInterval);
+                          if(countdownEl) countdownEl.classList.add('hidden');
+                          // Actually click the Run One-to-Many button
+                          const runBtn = document.getElementById('btnRunOneToMany');
+                          if(runBtn) runBtn.click();
+                        }
+                      }, 1000);
+                      // Show initial message immediately
+                      if(countdownEl) countdownEl.textContent = `Starting next run in ${secondsLeft} seconds...`;
+                    } else if(autoRunState.remaining>0){
+                      // No delay, run immediately
+                      setTimeout(()=>{
+                        const runBtn = document.getElementById('btnRunOneToMany');
+                        if(runBtn) runBtn.click();
+                      }, 100);
+                    }
+                  }catch(_e){}
+                } else {
+                  // No more items
+                  try{ const nm=document.getElementById('noMoreKitsMsg'); if(nm) nm.classList.remove('hidden'); }catch(_e){}
+                }
+              }catch(_e){}
+            } else {
+              alert('Save failed: '+(data?.message||res.status));
+            }
+          }catch(e){ alert('Failed to save to Atlas: '+(e?.message||e)); }
+        }; }
+        // Auto-save once when ready (no button click required)
+        try{
+          const currentKey = `${(store?.gmOcn||'').trim()}|${kit}`;
+          if(!reportsHalted && kit && (store?.gmOcn||'').trim() && !autoSaveAtlasGuard.inProgress && autoSaveAtlasGuard.lastKey!==currentKey){
+            autoSaveAtlasGuard.inProgress=true;
+            autoSaveAtlasGuard.lastKey=currentKey;
+            if(btnSave && typeof btnSave.onclick==='function'){
+              await btnSave.onclick();
+            }
+            autoSaveAtlasGuard.inProgress=false;
+          }
+        }catch(_e){}
+      } else {
+        status.textContent = 'Not ready';
+        btn.disabled=true;
+        btn.onclick=null;
+        if(btnSave){ btnSave.disabled=true; btnSave.onclick=null; }
+      }
+    }catch(_e){}
+  }
 })();

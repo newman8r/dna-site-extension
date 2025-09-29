@@ -159,6 +159,46 @@ async function main() {
     setTimeout(() => URL.revokeObjectURL(url), 10_000);
   });
 
+  // Test-only: Save to Atlas (manual)
+  document.getElementById('saveToAtlas').addEventListener('click', async () => {
+    try {
+      const atlasEndpoint = (await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT')).ATLAS_LEGACY_ENDPOINT || 'http://localhost:3005';
+      const ocn = prompt('OCN (case_number)');
+      const kit = prompt('Kit number');
+      if (!ocn || !kit) return alert('OCN and Kit are required');
+      const site = 'PRO';
+      const status = 'success';
+      // Ask user to pick a ZIP file
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = '.zip';
+      input.onchange = async () => {
+        const file = input.files && input.files[0];
+        if (!file) return;
+        const form = new FormData();
+        form.append('ocn', ocn);
+        form.append('kit', kit);
+        form.append('site', site);
+        form.append('status', status);
+        form.append('file', file, file.name);
+        const res = await fetch(`${atlasEndpoint}/atlas/legacy/save?ocn=${encodeURIComponent(ocn)}&kit=${encodeURIComponent(kit)}&site=${site}&status=${status}`, {
+          method: 'POST',
+          body: form,
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data?.ok) {
+          alert('Saved to Atlas successfully');
+        } else {
+          alert(`Save failed: ${data?.message || res.status}`);
+        }
+      };
+      input.click();
+    } catch (e) {
+      console.error('[GM-Popup] saveToAtlas error', e);
+      alert('Failed to save to Atlas');
+    }
+  });
+
   // Restore UI on open
   if (state.session.profiles?.length) {
     renderList(state.session.profiles);

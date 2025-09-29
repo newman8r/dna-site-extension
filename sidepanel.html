@@ -30,6 +30,12 @@
   </head>
   <body>
     <h1>GEDmatch Importer</h1>
+    <div class="row controls">
+      <button id="tabMainBtn" class="btn btn-primary">Capture</button>
+      <button id="tabReportsBtn" class="btn">Reports (beta)</button>
+      <button id="tabSettingsBtn" class="btn">Settings</button>
+    </div>
+    <div id="panelMain">
     <div class="row">
       <input id="csvFile" type="file" accept=".csv" />
       <div class="muted">Load GEDmatch one-to-many CSV export</div>
@@ -46,16 +52,28 @@
       <button id="segParseBtn" class="btn">Parse Segments CSV</button>
       <span id="segStats" class="pill">Segments: 0 kits</span>
     </div>
+    <div class="row">
+      <label class="muted">OCN <input id="ocnInput" type="text" placeholder="Case OCN (optional)" style="margin-left:6px; width: 220px" /></label>
+    </div>
     <div class="row controls">
       <button id="clearSession" class="btn btn-danger">Clear Session</button>
       <span class="muted">Warning: this permanently clears the loaded CSV, list, statuses, and pending data.</span>
     </div>
 
     <div class="row">
-      <div class="muted">Optional: Paste ASCII pedigree (from GEDmatch page) and parse locally</div>
-      <textarea id="asciiText" rows="8" style="width:100%; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size:12px;"></textarea>
-      <div class="controls" style="margin-top:6px;">
-        <button id="btnParseAscii" class="btn">Parse ASCII</button>
+      <a href="#" id="advToggle" class="btn-link">Show advanced</a>
+    </div>
+    <div id="advancedPanel" class="hidden">
+      <div class="row">
+        <div class="muted">Optional: Paste ASCII pedigree (from GEDmatch page) and parse locally</div>
+        <textarea id="asciiText" rows="8" style="width:100%; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size:12px;"></textarea>
+        <div class="controls" style="margin-top:6px;">
+          <button id="btnParseAscii" class="btn">Parse ASCII</button>
+        </div>
+      </div>
+      <div class="row controls">
+        <button id="openNext" class="btn">Open Next</button>
+        <button id="exportJson" class="btn">Export JSON</button>
       </div>
     </div>
 
@@ -98,10 +116,8 @@
       </div>
     </div>
     <div class="row controls">
-      <button id="openNext" class="btn">Open Next</button>
       <button id="autoAllCsv" class="btn">Get All (auto)</button>
       <button id="downloadZipAll" class="btn">Download All GEDCOMs (zip)</button>
-      <button id="exportJson" class="btn">Export JSON</button>
     </div>
     <div class="row">
       <label><input type="checkbox" id="includeFloatingIndis" /> add floating individuals</label>
@@ -111,6 +127,82 @@
         <span id="floatingPreview" class="muted" style="margin-left:8px"></span>
       </div>
     </div>
+    </div>
+    <div id="panelReports" class="hidden">
+      <div class="row">
+        <div class="muted">Run one-to-many segment-based report for a Kit ID</div>
+        <div class="controls" style="margin-top:6px; gap:6px;">
+          <label class="muted">Kit ID <input id="oneToManyKit" type="text" placeholder="e.g., WA4131462" style="margin-left:6px; width: 180px" /></label>
+          <button id="btnRunOneToMany" class="btn btn-primary">Run One-to-Many</button>
+          <button id="btnLoadNextAtlas" class="btn">Load Next</button>
+        </div>
+        <div class="controls" style="margin-top:6px; gap:12px;">
+          <label class="muted">Kits to grab <input id="autoRunLimit" type="number" min="0" step="1" value="0" style="margin-left:6px; width:100px" /></label>
+          <label class="muted">Delay (sec) <input id="autoRunDelay" type="number" min="0" step="1" value="0" style="margin-left:6px; width:100px" /></label>
+        </div>
+        <div class="muted" style="margin-top:6px;">This opens the one-to-many page and auto-clicks Search. Next step: auto-download CSV.</div>
+      </div>
+      <div class="row">
+        <div class="muted">Downloaded reports</div>
+        <div id="reportsFiles" class="list" style="max-height: 200px; overflow:auto; border:1px solid #ddd; padding:6px;"></div>
+        <div id="loginWarning" class="row muted hidden" style="color:#b00020; margin-top:6px;">Login required on GEDmatch. Please log in and try again.</div>
+        <div id="noMoreKitsMsg" class="row muted hidden" style="color:#b00020; margin-top:6px;">No more kits to load.</div>
+        <div id="autoRunCountdown" class="row hidden" style="color:#1976d2; margin-top:6px; font-weight:bold;">Starting next run in 0 seconds...</div>
+        <div class="row" style="margin-top:6px; display:flex; gap:12px; align-items:center;">
+          <span>Progress:</span>
+          <span id="statusOneToMany" class="pill">One-to-Many CSV <span class="dot red" style="margin-left:6px;"></span></span>
+          <span id="statusSegments" class="pill">Segments CSV <span class="dot red" style="margin-left:6px;"></span></span>
+          <span id="statusAutoKinship" class="pill">Auto-Kinship ZIP <span class="dot red" style="margin-left:6px;"></span></span>
+        </div>
+      </div>
+      <div class="row">
+        <label class="muted">OCN <input id="ocnInputReports" type="text" placeholder="Case OCN (optional)" style="margin-left:6px; width: 180px" /></label>
+      </div>
+      <div class="row">
+        <div class="muted">Auto-Kinship (requires both CSVs downloaded)</div>
+        <div class="controls" style="margin-top:6px; gap:6px;">
+          <button id="btnRunAutoKinship" class="btn" disabled>Run Auto-Kinship</button>
+        </div>
+      </div>
+      <div class="row">
+        <div class="muted">Bundle</div>
+        <div id="reportsBundle" class="list" style="padding:6px; border:1px solid #ddd; display:flex; gap:12px; align-items:center;">
+          <span id="bundleStatus" class="pill">Not ready</span>
+          <button id="btnDownloadBundle" class="btn" disabled>Download Bundle</button>
+          <button id="btnSaveToAtlas" class="btn" disabled>Save to Atlas</button>
+        </div>
+      </div>
+      <div class="row">
+        <div class="muted">Logs (reports)</div>
+        <div id="reportsLog" class="list" style="max-height: 220px; overflow:auto; border:1px solid #ddd; padding:6px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size: 11px; white-space: pre-wrap;"></div>
+      </div>
+    </div>
+    
+    <div id="panelSettings" class="hidden">
+      <div class="row">
+        <h2 style="font-size: 14px; margin: 12px 0 8px;">Backend Configuration</h2>
+      </div>
+      <div class="row">
+        <label for="atlasEndpoint" style="display: block; margin-bottom: 4px;">
+          <span class="muted">Atlas Backend URL</span>
+        </label>
+        <input type="text" id="atlasEndpoint" style="width: 100%; padding: 6px; border: 1px solid #ddd; border-radius: 4px;" placeholder="https://atlas.othram.com:8080/api" />
+        <div class="muted" style="margin-top: 4px; font-size: 11px;">
+          Default: https://atlas.othram.com:8080/api<br/>
+          For local development: http://localhost:3005
+        </div>
+      </div>
+      <div class="row" style="margin-top: 12px;">
+        <button id="saveSettings" class="btn btn-primary">Save Settings</button>
+        <span id="settingsSaved" class="muted hidden" style="margin-left: 8px; color: #43a047;">✓ Settings saved</span>
+      </div>
+      <div class="row" style="margin-top: 20px; padding-top: 12px; border-top: 1px solid #ddd;">
+        <div class="muted" style="font-size: 11px;">
+          <strong>Note:</strong> Changes take effect immediately for all new requests.
+        </div>
+      </div>
+    </div>
+    
     <script src="sidepanel.js"></script>
   </body>
 </html>
