@@ -2037,12 +2037,22 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
   let reportsHalted=false;
   function haltReports(reason){ reportsHalted=true; try{ const lw=document.getElementById('loginWarning'); if(lw) lw.classList.remove('hidden'); }catch(_e){} console.warn('[Reports] halted:', reason); }
   function ensureNotHalted(){ if(reportsHalted) throw new Error('reports-halted'); }
+  // Auto-save guard to avoid duplicate uploads
+  const autoSaveAtlasGuard={ inProgress:false, lastKey:'' };
   const btnRun=document.getElementById('btnRunOneToMany');
   const kitInput=document.getElementById('oneToManyKit');
   if(btnRun&&kitInput){
     btnRun.onclick = async () => {
       const kit=(kitInput.value||'').trim(); if(!kit){ alert('Enter a Kit ID first.'); return; }
       reportsHalted=false;
+      // Clear previous report artifacts to ensure a clean 3-file run (one, seg, ak)
+      try{
+        await chrome.storage.local.set({ gmReportsFiles: [] });
+        renderReportsFiles([]);
+        await refreshReportStatus();
+        await updateBundleUi();
+        try{ const lw=document.getElementById('loginWarning'); if(lw) lw.classList.add('hidden'); }catch(_e){}
+      }catch(_e){}
       console.log('[Reports] Starting automation for kit:', kit);
       const url=`https://pro.gedmatch.com/tools/one-to-many-segment-based?kit_num=${encodeURIComponent(kit)}`;
       try{ await navLog(kit,{ area:'reports', step:'open-one-to-many', url }); }catch(_e){}
@@ -2073,6 +2083,44 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
           renderReportsLog();
       }catch(e){ if(String(e?.message||'')!=='reports-halted'){ console.warn('Auto-click failed', e); } }
       await waitForTabComplete(tab.id, 30000);
+      // After search completes, check for inline error message (e.g., access denied)
+      try{
+        const resErr = await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
+          const el=document.querySelector('.form-item--error-message');
+          const txt=(el && (el.textContent||'').trim())||'';
+          return { has: !!txt, text: txt };
+        }});
+        const errInfo = resErr && resErr[0] && resErr[0].result;
+        if(errInfo && errInfo.has){
+          haltReports('one-to-many-error');
+          try{ await navLog(kit,{ area:'reports', step:'one-to-many-error', message: errInfo.text }); }catch(_e){}
+          try{ await chrome.storage.local.set({ gmReportsFiles: [] }); renderReportsFiles([]); refreshReportStatus(); updateBundleUi(); }catch(_e){}
+          // Save error to Atlas and load next item
+          try{
+            const ocnEl=document.getElementById('ocnInputReports');
+            let ocn = '';
+            try{ ocn=(ocnEl?.value||'').trim(); }catch(_e){}
+            if(!ocn){ try{ const s=await chrome.storage.local.get(['gmOcn']); ocn=(s?.gmOcn||'').trim(); }catch(_e){} }
+            const base=(await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT')).ATLAS_LEGACY_ENDPOINT || 'http://localhost:3005';
+            const form=new FormData(); form.append('ocn', ocn); form.append('kit', kit); form.append('site','PRO'); form.append('status','error'); form.append('notes', errInfo.text||'');
+            const resp=await fetch(`${base}/atlas/legacy/save`, { method:'POST', body: form });
+            const data=await resp.json().catch(()=>({}));
+            if(resp.ok && data?.ok){
+              // auto-fill next
+              try{
+                const r=await fetch(`${base}/atlas/legacy/next?site=PRO`, { credentials:'include' });
+                const j=await r.json().catch(()=>({}));
+                if(r.ok && j?.ok && j?.item){
+                  const { kit: nextKit, ocn: nextOcn }=j.item;
+                  try{ const kitEl=document.getElementById('oneToManyKit'); if(kitEl){ kitEl.value=nextKit||''; } }catch(_e){}
+                  try{ const ocnEl2=document.getElementById('ocnInputReports'); if(ocnEl2){ ocnEl2.value=nextOcn||''; await chrome.storage.local.set({ gmOcn: (nextOcn||'').trim() }); } }catch(_e){}
+                }
+              }catch(_e){}
+            }
+          }catch(_e){}
+          return; // hard stop
+        }
+      }catch(_e){}
       // Click Download CSV button to generate the link
       try{ ensureNotHalted();
         await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
@@ -2315,6 +2363,24 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
       } catch(e){ console.error('Fetch CSV failed', e); if(String(e?.message||'')!=='reports-halted'){ alert('Failed to fetch CSV: '+String(e?.message||e)); } }
     };
   }
+
+  // Load next pending (Atlas Legacy) — fills Kit and OCN inputs only
+  (function setupLoadNext(){
+    const btn=document.getElementById('btnLoadNextAtlas');
+    if(!btn) return;
+    btn.addEventListener('click', async ()=>{
+      try{
+        // Read base endpoint from storage; default localhost
+        const base=(await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT')).ATLAS_LEGACY_ENDPOINT || 'http://localhost:3005';
+        const resp=await fetch(`${base}/atlas/legacy/next?site=PRO`, { credentials:'include' });
+        const data=await resp.json().catch(()=>({}));
+        if(!resp.ok || !data?.ok || !data?.item){ alert('No pending legacy items.'); return; }
+        const { kit, ocn } = data.item;
+        try{ const kitEl=document.getElementById('oneToManyKit'); if(kitEl){ kitEl.value=kit||''; } }catch(_e){}
+        try{ const ocnEl=document.getElementById('ocnInputReports'); if(ocnEl){ ocnEl.value=ocn||''; await chrome.storage.local.set({ gmOcn: (ocn||'').trim() }); } }catch(_e){}
+      }catch(e){ alert('Failed to load next from Atlas: '+String(e?.message||e)); }
+    });
+  })();
 
   function renderReportsFiles(files){
     const el=document.getElementById('reportsFiles'); if(!el) return;
@@ -2760,6 +2826,18 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
             else { alert('Save failed: '+(data?.message||res.status)); }
           }catch(e){ alert('Failed to save to Atlas: '+(e?.message||e)); }
         }; }
+        // Auto-save once when ready (no button click required)
+        try{
+          const currentKey = `${(store?.gmOcn||'').trim()}|${kit}`;
+          if(!reportsHalted && kit && (store?.gmOcn||'').trim() && !autoSaveAtlasGuard.inProgress && autoSaveAtlasGuard.lastKey!==currentKey){
+            autoSaveAtlasGuard.inProgress=true;
+            autoSaveAtlasGuard.lastKey=currentKey;
+            if(btnSave && typeof btnSave.onclick==='function'){
+              await btnSave.onclick();
+            }
+            autoSaveAtlasGuard.inProgress=false;
+          }
+        }catch(_e){}
       } else {
         status.textContent = 'Not ready';
         btn.disabled=true;
