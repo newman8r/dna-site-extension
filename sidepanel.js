@@ -2039,6 +2039,8 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
   function ensureNotHalted(){ if(reportsHalted) throw new Error('reports-halted'); }
   // Auto-save guard to avoid duplicate uploads
   const autoSaveAtlasGuard={ inProgress:false, lastKey:'' };
+  // Auto-run state
+  const autoRunState={ remaining:0, delaySec:0, running:false };
   const btnRun=document.getElementById('btnRunOneToMany');
   const kitInput=document.getElementById('oneToManyKit');
   if(btnRun&&kitInput){
@@ -2106,14 +2108,54 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
             const resp=await fetch(`${base}/atlas/legacy/save`, { method:'POST', body: form });
             const data=await resp.json().catch(()=>({}));
             if(resp.ok && data?.ok){
-              // auto-fill next
+              // auto-fill next and auto-run based on limit/delay
               try{
+                try{ const nm=document.getElementById('noMoreKitsMsg'); if(nm) nm.classList.add('hidden'); }catch(_e){}
                 const r=await fetch(`${base}/atlas/legacy/next?site=PRO`, { credentials:'include' });
                 const j=await r.json().catch(()=>({}));
                 if(r.ok && j?.ok && j?.item){
                   const { kit: nextKit, ocn: nextOcn }=j.item;
+                  // decrement remaining and read delay
+                  try{
+                    const limEl=document.getElementById('autoRunLimit');
+                    const delayEl=document.getElementById('autoRunDelay');
+                    autoRunState.remaining = Math.max(0, parseInt(limEl?.value||'0',10)||0);
+                    autoRunState.delaySec = Math.max(0, parseInt(delayEl?.value||'0',10)||0);
+                    if(autoRunState.remaining>0){ autoRunState.remaining -= 1; if(limEl){ limEl.value=String(autoRunState.remaining); } }
+                  }catch(_e){}
+                  // Fill next values
                   try{ const kitEl=document.getElementById('oneToManyKit'); if(kitEl){ kitEl.value=nextKit||''; } }catch(_e){}
                   try{ const ocnEl2=document.getElementById('ocnInputReports'); if(ocnEl2){ ocnEl2.value=nextOcn||''; await chrome.storage.local.set({ gmOcn: (nextOcn||'').trim() }); } }catch(_e){}
+                  // schedule next run if remaining>0 with countdown display
+                  try{
+                    if(autoRunState.remaining>0 && autoRunState.delaySec>0){
+                      // Show countdown timer
+                      const countdownEl = document.getElementById('autoRunCountdown');
+                      if(countdownEl) countdownEl.classList.remove('hidden');
+                      let secondsLeft = autoRunState.delaySec;
+                      const countdownInterval = setInterval(()=>{
+                        if(countdownEl) countdownEl.textContent = `Starting next run in ${secondsLeft} seconds...`;
+                        secondsLeft--;
+                        if(secondsLeft < 0){
+                          clearInterval(countdownInterval);
+                          if(countdownEl) countdownEl.classList.add('hidden');
+                          // Actually click the Run One-to-Many button
+                          const runBtn = document.getElementById('btnRunOneToMany');
+                          if(runBtn) runBtn.click();
+                        }
+                      }, 1000);
+                      // Show initial message immediately
+                      if(countdownEl) countdownEl.textContent = `Starting next run in ${secondsLeft} seconds...`;
+                    } else if(autoRunState.remaining>0){
+                      // No delay, run immediately
+                      setTimeout(()=>{
+                        const runBtn = document.getElementById('btnRunOneToMany');
+                        if(runBtn) runBtn.click();
+                      }, 100);
+                    }
+                  }catch(_e){}
+                } else {
+                  try{ const nm=document.getElementById('noMoreKitsMsg'); if(nm) nm.classList.remove('hidden'); }catch(_e){}
                 }
               }catch(_e){}
             }
@@ -2822,8 +2864,64 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
               body: form 
             });
             const data = await res.json().catch(()=>({}));
-            if(res.ok && data?.ok){ alert('Saved to Atlas'); }
-            else { alert('Save failed: '+(data?.message||res.status)); }
+            if(res.ok && data?.ok){
+              // Success: silently proceed to load the next kit and auto-run based on limit/delay
+              try{
+                // Hide any previous message
+                try{ const nm=document.getElementById('noMoreKitsMsg'); if(nm) nm.classList.add('hidden'); }catch(_e){}
+                const r=await fetch(`${base}/atlas/legacy/next?site=PRO`, { credentials:'include' });
+                const j=await r.json().catch(()=>({}));
+                if(r.ok && j?.ok && j?.item){
+                  const { kit: nextKit, ocn: nextOcn }=j.item;
+                  // decrement remaining and read delay
+                  try{
+                    const limEl=document.getElementById('autoRunLimit');
+                    const delayEl=document.getElementById('autoRunDelay');
+                    autoRunState.remaining = Math.max(0, parseInt(limEl?.value||'0',10)||0);
+                    autoRunState.delaySec = Math.max(0, parseInt(delayEl?.value||'0',10)||0);
+                    if(autoRunState.remaining>0){ autoRunState.remaining -= 1; if(limEl){ limEl.value=String(autoRunState.remaining); } }
+                  }catch(_e){}
+                  // Fill next values
+                  try{ const kitEl=document.getElementById('oneToManyKit'); if(kitEl){ kitEl.value=nextKit||''; } }catch(_e){}
+                  try{ const ocnEl=document.getElementById('ocnInputReports'); if(ocnEl){ ocnEl.value=nextOcn||''; await chrome.storage.local.set({ gmOcn: (nextOcn||'').trim() }); } }catch(_e){}
+                  // Clear previous files before starting next run
+                  try{ await chrome.storage.local.set({ gmReportsFiles: [] }); renderReportsFiles([]); refreshReportStatus(); updateBundleUi(); }catch(_e){}
+                  // schedule next run if remaining>0 with countdown display
+                  try{
+                    if(autoRunState.remaining>0 && autoRunState.delaySec>0){
+                      // Show countdown timer
+                      const countdownEl = document.getElementById('autoRunCountdown');
+                      if(countdownEl) countdownEl.classList.remove('hidden');
+                      let secondsLeft = autoRunState.delaySec;
+                      const countdownInterval = setInterval(()=>{
+                        if(countdownEl) countdownEl.textContent = `Starting next run in ${secondsLeft} seconds...`;
+                        secondsLeft--;
+                        if(secondsLeft < 0){
+                          clearInterval(countdownInterval);
+                          if(countdownEl) countdownEl.classList.add('hidden');
+                          // Actually click the Run One-to-Many button
+                          const runBtn = document.getElementById('btnRunOneToMany');
+                          if(runBtn) runBtn.click();
+                        }
+                      }, 1000);
+                      // Show initial message immediately
+                      if(countdownEl) countdownEl.textContent = `Starting next run in ${secondsLeft} seconds...`;
+                    } else if(autoRunState.remaining>0){
+                      // No delay, run immediately
+                      setTimeout(()=>{
+                        const runBtn = document.getElementById('btnRunOneToMany');
+                        if(runBtn) runBtn.click();
+                      }, 100);
+                    }
+                  }catch(_e){}
+                } else {
+                  // No more items
+                  try{ const nm=document.getElementById('noMoreKitsMsg'); if(nm) nm.classList.remove('hidden'); }catch(_e){}
+                }
+              }catch(_e){}
+            } else {
+              alert('Save failed: '+(data?.message||res.status));
+            }
           }catch(e){ alert('Failed to save to Atlas: '+(e?.message||e)); }
         }; }
         // Auto-save once when ready (no button click required)

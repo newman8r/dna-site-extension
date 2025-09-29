@@ -135,12 +135,18 @@
           <button id="btnRunOneToMany" class="btn btn-primary">Run One-to-Many</button>
           <button id="btnLoadNextAtlas" class="btn">Load Next</button>
         </div>
+        <div class="controls" style="margin-top:6px; gap:12px;">
+          <label class="muted">Kits to grab <input id="autoRunLimit" type="number" min="0" step="1" value="0" style="margin-left:6px; width:100px" /></label>
+          <label class="muted">Delay (sec) <input id="autoRunDelay" type="number" min="0" step="1" value="0" style="margin-left:6px; width:100px" /></label>
+        </div>
         <div class="muted" style="margin-top:6px;">This opens the one-to-many page and auto-clicks Search. Next step: auto-download CSV.</div>
       </div>
       <div class="row">
         <div class="muted">Downloaded reports</div>
         <div id="reportsFiles" class="list" style="max-height: 200px; overflow:auto; border:1px solid #ddd; padding:6px;"></div>
         <div id="loginWarning" class="row muted hidden" style="color:#b00020; margin-top:6px;">Login required on GEDmatch. Please log in and try again.</div>
+        <div id="noMoreKitsMsg" class="row muted hidden" style="color:#b00020; margin-top:6px;">No more kits to load.</div>
+        <div id="autoRunCountdown" class="row hidden" style="color:#1976d2; margin-top:6px; font-weight:bold;">Starting next run in 0 seconds...</div>
         <div class="row" style="margin-top:6px; display:flex; gap:12px; align-items:center;">
           <span>Progress:</span>
           <span id="statusOneToMany" class="pill">One-to-Many CSV <span class="dot red" style="margin-left:6px;"></span></span>
