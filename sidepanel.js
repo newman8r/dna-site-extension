@@ -2014,23 +2014,28 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
     ocnInput.addEventListener('input', async ()=>{ await chrome.storage.local.set({ gmOcn: ocnInput.value.trim() }); });
   }
 
-  // Tabs (Capture / Reports / Settings)
+  // Tabs (Capture / Reports / Tools / Settings)
   const tabMainBtn=document.getElementById('tabMainBtn');
   const tabReportsBtn=document.getElementById('tabReportsBtn');
+  const tabToolsBtn=document.getElementById('tabToolsBtn');
   const tabSettingsBtn=document.getElementById('tabSettingsBtn');
   const panelMain=document.getElementById('panelMain');
   const panelReports=document.getElementById('panelReports');
+  const panelTools=document.getElementById('panelTools');
   const panelSettings=document.getElementById('panelSettings');
   
   function showPanel(which){ 
     // Hide all panels and remove btn-primary from all tabs
-    [panelMain, panelReports, panelSettings].forEach(p => p?.classList.add('hidden'));
-    [tabMainBtn, tabReportsBtn, tabSettingsBtn].forEach(b => b?.classList.remove('btn-primary'));
+    [panelMain, panelReports, panelTools, panelSettings].forEach(p => p?.classList.add('hidden'));
+    [tabMainBtn, tabReportsBtn, tabToolsBtn, tabSettingsBtn].forEach(b => b?.classList.remove('btn-primary'));
     
     // Show selected panel and add btn-primary to selected tab
     if(which==='reports'){ 
       panelReports?.classList.remove('hidden'); 
       tabReportsBtn?.classList.add('btn-primary'); 
+    } else if(which==='tools'){
+      panelTools?.classList.remove('hidden');
+      tabToolsBtn?.classList.add('btn-primary');
     } else if(which==='settings'){ 
       panelSettings?.classList.remove('hidden'); 
       tabSettingsBtn?.classList.add('btn-primary');
@@ -2043,8 +2048,176 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
   if(tabMainBtn&&tabReportsBtn&&tabSettingsBtn){ 
     tabMainBtn.onclick=()=>showPanel('main'); 
     tabReportsBtn.onclick=()=>showPanel('reports'); 
+    if(tabToolsBtn) tabToolsBtn.onclick=()=>showPanel('tools');
     tabSettingsBtn.onclick=()=>showPanel('settings');
   }
+
+  // --- Tools: Legacy CSV → Floating GEDCOM ---
+  const legacyFilesInput=document.getElementById('legacyCsvFiles');
+  const toolsMinCmInput=document.getElementById('toolsMinCm');
+  const toolsStripWeird=document.getElementById('toolsStripWeird');
+  const toolsSortByNameSimilarity=document.getElementById('toolsSortByNameSimilarity');
+  const toolsPreview=document.getElementById('toolsPreview');
+  const btnToolsDownloadGedcom=document.getElementById('btnToolsDownloadGedcom');
+
+  function headerKey(s){ return String(s||'').toLowerCase().replace(/[^a-z0-9]+/g,''); }
+  function findIndex(header, candidates){ const map=new Map(header.map((h,i)=>[headerKey(h),i])); for(const c of candidates){ const i=map.get(headerKey(c)); if(i!=null) return i; } return -1; }
+  function parseNumber(str){ const n=parseFloat(String(str||'').replace(/[^0-9.\-]/g,'')); return isFinite(n)?n:0; }
+  function sanitizeName(raw){ const s=String(raw||'').trim(); const noStar=s.replace(/^\*/,''); try { return noStar.normalize('NFKC').replace(/[^\p{L}\p{N}\s'.,\/-]/gu,'').replace(/\s+/g,' ').trim(); } catch { return noStar.replace(/[^A-Za-z0-9\s'.,\/-]/g,'').replace(/\s+/g,' ').trim(); } }
+
+  function parseLegacyCsvText(text){
+    const rows=parseCsv(String(text||''));
+    if(!rows.length) return [];
+    const header=rows[0];
+    const body=rows.slice(1).filter(r=>r && r.length>1);
+    const idxPrimaryKit=findIndex(header, ['PrimaryKit','Kit','ReferenceKit']);
+    const idxPrimaryName=findIndex(header, ['PrimaryName','Primary Name','ReferenceName']);
+    const idxMatchedKit=findIndex(header, ['MatchedKit','MatchKit','Kit2','Kit #','KitId']);
+    const idxMatchedName=findIndex(header, ['MatchedName','Name','MatchName']);
+    const idxMatchedEmail=findIndex(header, ['MatchedEmail','Email','MatchEmail']);
+    const idxTotalCm=findIndex(header, ['TotalCM','Total cM - Autosomal','Total cM','AtdnaTotal']);
+    const idxLargest=findIndex(header, ['LargestSeg','Largest - Autosomal','LargestCm']);
+    const idxSite=findIndex(header, ['TestCompany','Site','Source']);
+    const out=[];
+    for(const r of body){
+      const rec={
+        primaryKit: idxPrimaryKit>=0? (r[idxPrimaryKit]||'') : '',
+        primaryName: idxPrimaryName>=0? (r[idxPrimaryName]||'') : '',
+        matchedKit: idxMatchedKit>=0? (r[idxMatchedKit]||'') : '',
+        matchedName: idxMatchedName>=0? (r[idxMatchedName]||'') : '',
+        matchedEmail: idxMatchedEmail>=0? (r[idxMatchedEmail]||'') : '',
+        totalCm: idxTotalCm>=0? parseNumber(r[idxTotalCm]) : 0,
+        largestCm: idxLargest>=0? parseNumber(r[idxLargest]) : 0,
+        site: idxSite>=0? String(r[idxSite]||'').trim() : ''
+      };
+      if(rec.matchedKit || rec.matchedName || rec.matchedEmail) out.push(rec);
+    }
+    return out;
+  }
+
+  async function updateToolsPreview(){
+    try{
+      const store=await chrome.storage.local.get(['gmToolsLegacyRecs']);
+      const recs=store.gmToolsLegacyRecs||[];
+      const minCm=parseFloat(toolsMinCmInput?.value||'0')||0;
+      const kept=recs.filter(r=> (r?.totalCm||0) >= minCm);
+      if(toolsPreview) toolsPreview.textContent=`${recs.length} matches loaded • ${kept.length} pass`;
+    }catch(_e){ if(toolsPreview) toolsPreview.textContent='0 matches loaded'; }
+  }
+
+  if(legacyFilesInput){
+    legacyFilesInput.addEventListener('change', async ()=>{
+      const files=Array.from(legacyFilesInput.files||[]);
+      if(!files.length){ await chrome.storage.local.remove('gmToolsLegacyRecs'); updateToolsPreview(); return; }
+      const texts=await Promise.all(files.map(f=>f.text().catch(()=>'')));
+      const recs=[]; for(const t of texts){ recs.push(...parseLegacyCsvText(t)); }
+      await chrome.storage.local.set({ gmToolsLegacyRecs: recs });
+      updateToolsPreview();
+    });
+  }
+  toolsMinCmInput?.addEventListener('input', updateToolsPreview);
+
+  if(btnToolsDownloadGedcom){
+    btnToolsDownloadGedcom.onclick = async () => {
+      try{
+        const strip=!!(toolsStripWeird?.checked);
+        const minCm=parseFloat(toolsMinCmInput?.value||'0')||0;
+        const sortSimilar=!!(toolsSortByNameSimilarity?.checked);
+        const store=await chrome.storage.local.get(['gmToolsLegacyRecs']);
+        const recs=(store.gmToolsLegacyRecs||[]).filter(r=> (r?.totalCm||0) >= minCm);
+        // Deduplicate by matchedKit keeping highest totalCm
+        const byKit=new Map();
+        for(const r of recs){ const key=(r.matchedKit||'').trim(); if(!key) continue; const prev=byKit.get(key); if(!prev || (r.totalCm||0)>(prev.totalCm||0)) byKit.set(key,r); }
+        let list=Array.from(byKit.values());
+        if(sortSimilar){
+          // Prefer grouping by surname when available; otherwise order by Levenshtein similarity
+          function normName(s){ const t=String(s||'').toLowerCase().normalize?.('NFKC')||String(s||'').toLowerCase(); return t.replace(/[^\p{L}\p{N}\s]/gu,' ').replace(/\s+/g,' ').trim(); }
+          function extractSurname(name){
+            const n=normName(name).replace(/^\*/,'').trim();
+            // Try GEDCOM-style /Surname/
+            const m=/\/(.+?)\//.exec(name||''); if(m && m[1]) return normName(m[1]);
+            if(!n) return '';
+            // Drop common suffix tokens
+            const SUF=new Set(['jr','sr','ii','iii','iv','v']);
+            const toks=n.split(' ').filter(Boolean).filter(t=>!SUF.has(t));
+            if(toks.length>=2) return toks[toks.length-1];
+            return '';
+          }
+          function levenshtein(a,b){
+            a=normName(a); b=normName(b);
+            const m=a.length, n=b.length; if(m===0) return n; if(n===0) return m;
+            const dp=new Array(n+1); for(let j=0;j<=n;j++) dp[j]=j;
+            for(let i=1;i<=m;i++){
+              let prev=dp[0]; dp[0]=i;
+              for(let j=1;j<=n;j++){
+                const temp=dp[j];
+                const cost=(a.charCodeAt(i-1)===b.charCodeAt(j-1))?0:1;
+                dp[j]=Math.min(dp[j]+1, dp[j-1]+1, prev+cost);
+                prev=temp;
+              }
+            }
+            return dp[n];
+          }
+          const withSn=[]; const noSn=[];
+          for(const r of list){ const sn=extractSurname(r.matchedName); if(sn){ withSn.push({ r, sn }); } else { noSn.push(r); } }
+          // Sort surname groups lexicographically; inside group by given name for stability
+          withSn.sort((a,b)=> a.sn.localeCompare(b.sn) || normName(a.r.matchedName).localeCompare(normName(b.r.matchedName)));
+          // Levenshtein order for no-surname set
+          if(noSn.length>1){
+            const used=new Array(noSn.length).fill(false);
+            let startIdx=noSn.map(x=>normName(x.matchedName)).reduce((best,_,i,arr)=> arr[i]<arr[best]?i:best,0);
+            const ordered=[]; let current=startIdx; used[current]=true; ordered.push(noSn[current]);
+            for(let step=1; step<noSn.length; step++){
+              let bestJ=-1, bestD=Infinity; const curName=noSn[current].matchedName;
+              for(let j=0;j<noSn.length;j++){ if(used[j]) continue; const d=levenshtein(curName, noSn[j].matchedName); if(d<bestD){ bestD=d; bestJ=j; } }
+              if(bestJ===-1) break; used[bestJ]=true; ordered.push(noSn[bestJ]); current=bestJ;
+            }
+            for(let j=0;j<noSn.length;j++){ if(!used[j]) ordered.push(noSn[j]); }
+            list=[...withSn.map(x=>x.r), ...ordered];
+          } else {
+            list=[...withSn.map(x=>x.r), ...noSn];
+          }
+        }
+        const lines=[]; const now=new Date(); const yyyy=now.getFullYear(); const mm=String(now.getMonth()+1).padStart(2,'0'); const dd=String(now.getDate()).padStart(2,'0');
+        lines.push('0 HEAD','1 SOUR GedMapper','2 NAME GedMapper Tools — Legacy CSV Import','2 VERS 0.1','1 DATE '+`${yyyy}-${mm}-${dd}`,'1 SUBM @SUB1@','1 GEDC','2 VERS 5.5.1','2 FORM LINEAGE-LINKED','1 CHAR UTF-8');
+        lines.push('0 @SUB1@ SUBM','1 NAME GEDmatch Importer User');
+        const idFor=(i)=>`@I${i+1}@`;
+        list.forEach((r,i)=>{
+          let name=String(r.matchedName||'Unknown').trim();
+          if(strip) name=sanitizeName(name);
+          if(!name) name='Unknown';
+          const kit=String(r.matchedKit||'').trim();
+          const email=String(r.matchedEmail||'').trim();
+          const total=String(r.totalCm||'').trim();
+          const siteRaw=String(r.site||'').trim();
+          const site=siteRaw?siteRaw.toUpperCase(): 'GEDMATCH';
+          const matchedTo=String(r.primaryKit||'').trim();
+          let matchedName=String(r.primaryName||'').trim();
+          if(strip) matchedName=sanitizeName(matchedName);
+          lines.push(`0 ${idFor(i)} INDI`);
+          lines.push(`1 NAME ${name}`);
+          lines.push('1 SEX U');
+          if(total) lines.push(`1 _OM_ATDNA ${total}`);
+          if(kit){
+            lines.push('1 _OM_DNA_SOURCE');
+            lines.push(`2 _OM_KIT_ID ${kit}`);
+            lines.push(`2 _OM_KIT_SITE ${site}`);
+            if(email) lines.push(`2 _OM_SUBMITTER_EMAIL ${email}`);
+            if(matchedTo) lines.push(`2 _OM_MATCHED_TO ${matchedTo}`);
+            if(matchedName) lines.push(`2 _OM_MATCHED_NAME ${matchedName}`);
+          }
+        });
+        lines.push('0 TRLR');
+        const blob=new Blob([lines.join('\n')], { type:'text/plain' });
+        const url=URL.createObjectURL(blob);
+        const filename='legacy-csv-floating.ged';
+        await chrome.downloads.download({ url, filename, saveAs:true });
+        setTimeout(()=>URL.revokeObjectURL(url), 10000);
+      }catch(e){ alert('Failed to build GEDCOM: '+(e?.message||e)); }
+    };
+  }
+  // Initialize preview on load
+  updateToolsPreview();
   
   // Settings panel logic
   (async ()=>{
