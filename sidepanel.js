@@ -2218,6 +2218,151 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
   }
   // Initialize preview on load
   updateToolsPreview();
+
+  // ---- Tools: Project Kits Collector ----
+  const projThrottleSecInput=document.getElementById('projThrottleSec');
+  const btnProjStart=document.getElementById('btnProjStart');
+  const btnProjPause=document.getElementById('btnProjPause');
+  const btnProjResume=document.getElementById('btnProjResume');
+  const btnProjDownloadCsv=document.getElementById('btnProjDownloadCsv');
+  const btnProjClear=document.getElementById('btnProjClear');
+  const projStatus=document.getElementById('projStatus');
+
+  // State persisted in storage to allow resume
+  async function getProjState(){ const s=await chrome.storage.local.get(['gmProjCollector']); return s.gmProjCollector||{ running:false, paused:false, currentPageUrl:'https://pro.gedmatch.com/', queue:[], seenProjects:new Set(), results:[], lastRunAt:null, idx:0, throttleMs: (Number(projThrottleSecInput?.value||'7')||7)*1000 }; }
+  async function setProjState(st){ await chrome.storage.local.set({ gmProjCollector: { ...st, seenProjects: Array.from(st.seenProjects||[]) } }); }
+
+  function updateProjStatus(text){ if(projStatus) projStatus.textContent=text; }
+
+  // Utility: wait for a selector to appear in page
+  async function waitForSelectorInTab(tabId, selector, timeoutMs=15000){
+    const start=Date.now();
+    while(Date.now()-start < timeoutMs){
+      try{
+        const [{ result } = {}] = await chrome.scripting.executeScript({ target:{ tabId }, func:(sel)=>{ return !!document.querySelector(sel); }, args:[selector] });
+        if(result) return true;
+      }catch(_e){}
+      await delay(250);
+    }
+    return false;
+  }
+
+  // Scrape one dashboard page for project links and next page
+  async function scrapeDashboardProjects(tabId){
+    const [{ result } = {}] = await chrome.scripting.executeScript({ target:{ tabId }, func:()=>{
+      const out={ projects:[], next:null };
+      const tables=Array.from(document.querySelectorAll('table.responsive-enabled.table'));
+      let table=null;
+      for(const t of tables){
+        const headers=Array.from(t.querySelectorAll('thead th')).map(th=> (th.textContent||'').trim());
+        if(headers.some(h=>/project\s*title/i.test(h))){ table=t; break; }
+      }
+      if(!table) table = tables[0] || null;
+      if(table){
+        const rows=Array.from(table.querySelectorAll('tbody tr'));
+        const seen=new Set();
+        for(const tr of rows){
+          // Prefer the second column link; fallback to any '/digits' link inside row
+          let a=tr.querySelector('td:nth-child(2) a[href^="/"]');
+          if(!a){ a=tr.querySelector('a[href^="/"]'); }
+          if(!a) continue;
+          const href=a.getAttribute('href')||'';
+          const m=href.match(/^\/(\d+)$/);
+          if(m){
+            const projId=m[1];
+            if(!seen.has(projId)){
+              seen.add(projId);
+              out.projects.push({ id: projId, url: new URL(href, location.origin).toString() });
+            }
+          }
+        }
+      }
+      const nextLi=document.querySelector('li.pager__item.pager__item--next');
+      if(nextLi){
+        const a=nextLi.querySelector('a');
+        if(a){ out.next=new URL(a.getAttribute('href'), location.href).toString(); }
+      }
+      return out;
+    }});
+    return result||{ projects:[], next:null };
+  }
+
+  // Scrape a project page for kits
+  async function scrapeProjectKits(tabId, projectId){
+    const [{ result } = {}] = await chrome.scripting.executeScript({ target:{ tabId }, func:(pid)=>{
+      const out=[];
+      const table=document.querySelector('table.responsive-enabled.table');
+      if(table){
+        const rows=Array.from(table.querySelectorAll('tbody tr'));
+        for(const tr of rows){
+          // Kit number is in the link text in the 3rd column
+          const kitCell=tr.querySelector('td:nth-child(3) a');
+          const caseCell=tr.querySelector('td:nth-child(6)');
+          const kit=(kitCell?.textContent||'').trim();
+          const caseName=(caseCell?.textContent||'').trim();
+          if(kit) out.push({ projectId: pid, kit, caseName });
+        }
+      }
+      return out;
+    }, args:[projectId] });
+    return result||[];
+  }
+
+  async function delay(ms){ return new Promise(r=>setTimeout(r, ms)); }
+
+  async function runProjCollector(){
+    let st=await getProjState();
+    st.running=true; st.paused=false; st.lastRunAt=new Date().toISOString(); st.throttleMs=(Number(projThrottleSecInput?.value||'7')||7)*1000; st.seenProjects=new Set(st.seenProjects||[]);
+    await setProjState(st); updateProjStatus('running');
+    // Ensure a tab on dashboard
+    let tab=await chrome.tabs.create({ url: st.currentPageUrl||'https://pro.gedmatch.com/', active:true });
+    await waitForTabComplete(tab.id);
+    await waitForSelectorInTab(tab.id,'table.responsive-enabled.table tbody tr');
+    // Page loop: gather project links and enqueue
+    while(st.running && !st.paused){
+      const page=await scrapeDashboardProjects(tab.id);
+      // If no projects found on this page, try advancing pagination and continue
+      if(!page.projects || page.projects.length===0){
+        if(page.next){ st.currentPageUrl=page.next; await chrome.tabs.update(tab.id,{ url: page.next }); await waitForTabComplete(tab.id); await waitForSelectorInTab(tab.id,'table.responsive-enabled.table tbody tr'); continue; }
+      }
+      for(const p of (page.projects||[])){
+        if(!(st.seenProjects instanceof Set)) st.seenProjects=new Set(st.seenProjects||[]);
+        if(!st.seenProjects.has(p.id)){
+          st.queue.push(p); st.seenProjects.add(p.id);
+        }
+      }
+      await setProjState(st);
+      // Process queue items one by one with throttle
+      while(st.running && !st.paused && st.queue.length){
+        const item=st.queue.shift();
+        await chrome.tabs.update(tab.id, { url: item.url }); await waitForTabComplete(tab.id); await waitForSelectorInTab(tab.id,'table.responsive-enabled.table tbody tr');
+        const kits=await scrapeProjectKits(tab.id, item.id);
+        st.results.push(...kits);
+        await setProjState(st); updateProjStatus(`collected ${st.results.length} kit(s); remaining queue ${st.queue.length}`);
+        await delay(st.throttleMs);
+      }
+      if(st.paused || !st.running) break;
+      if(page.next){ st.currentPageUrl=page.next; await chrome.tabs.update(tab.id,{ url: page.next }); await waitForTabComplete(tab.id); await waitForSelectorInTab(tab.id,'table.responsive-enabled.table tbody tr'); }
+      else break;
+    }
+    updateProjStatus(st.paused ? 'paused' : 'completed');
+    await setProjState(st);
+  }
+
+  btnProjStart?.addEventListener('click', async ()=>{ const st=await getProjState(); st.running=true; st.paused=false; st.currentPageUrl='https://pro.gedmatch.com/'; st.queue=[]; st.seenProjects=new Set(); st.results=[]; await setProjState(st); runProjCollector(); });
+  btnProjPause?.addEventListener('click', async ()=>{ const st=await getProjState(); st.paused=true; st.running=false; await setProjState(st); updateProjStatus('paused'); });
+  btnProjResume?.addEventListener('click', async ()=>{ const st=await getProjState(); st.running=true; st.paused=false; await setProjState(st); runProjCollector(); });
+  btnProjClear?.addEventListener('click', async ()=>{ await chrome.storage.local.remove('gmProjCollector'); updateProjStatus('idle'); });
+  btnProjDownloadCsv?.addEventListener('click', async ()=>{
+    const st=await getProjState(); const rows=st.results||[];
+    const header=['ProjectId','Kit','CaseName'];
+    const lines=[header.join(',')];
+    const esc=(s)=>(''+(s??'')).replace(/"/g,'""');
+    for(const r of rows){ lines.push(`"${esc(r.projectId)}","${esc(r.kit)}","${esc(r.caseName)}"`); }
+    const blob=new Blob([lines.join('\n')], { type:'text/csv' });
+    const url=URL.createObjectURL(blob); const name=`gedmatch-project-kits-${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.csv`;
+    await chrome.downloads.download({ url, filename: name, saveAs:true }); setTimeout(()=>URL.revokeObjectURL(url), 10000);
+  });
   
   // Settings panel logic
   (async ()=>{
