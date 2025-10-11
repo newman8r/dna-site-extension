@@ -2227,12 +2227,43 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
   const btnProjDownloadCsv=document.getElementById('btnProjDownloadCsv');
   const btnProjClear=document.getElementById('btnProjClear');
   const projStatus=document.getElementById('projStatus');
+  const projConsole=document.getElementById('projConsole');
+  const phaseDiscDot=document.getElementById('phaseDiscDot');
+  const phaseCollDot=document.getElementById('phaseCollDot');
 
   // State persisted in storage to allow resume
-  async function getProjState(){ const s=await chrome.storage.local.get(['gmProjCollector']); return s.gmProjCollector||{ running:false, paused:false, currentPageUrl:'https://pro.gedmatch.com/', queue:[], seenProjects:new Set(), results:[], lastRunAt:null, idx:0, throttleMs: (Number(projThrottleSecInput?.value||'7')||7)*1000 }; }
-  async function setProjState(st){ await chrome.storage.local.set({ gmProjCollector: { ...st, seenProjects: Array.from(st.seenProjects||[]) } }); }
+  async function getProjState(){
+    const s=await chrome.storage.local.get(['gmProjCollector']);
+    const raw=s.gmProjCollector||{};
+    // Rehydrate sets and defaults
+    const seenSet=new Set(raw.seenProjects||[]);
+    return {
+      running: !!raw.running,
+      paused: !!raw.paused,
+      phase: raw.phase||'discover', // 'discover' | 'collect'
+      currentPageUrl: raw.currentPageUrl||'https://pro.gedmatch.com/',
+      queue: Array.isArray(raw.queue)? raw.queue: [],
+      discovered: Array.isArray(raw.discovered)? raw.discovered: [],
+      seenProjects: seenSet,
+      results: Array.isArray(raw.results)? raw.results: [],
+      lastRunAt: raw.lastRunAt||null,
+      idx: Number.isFinite(raw.idx)? raw.idx: 0,
+      throttleMs: (Number(projThrottleSecInput?.value||raw.throttleMs||'7')||7)*1000
+    };
+  }
+  async function setProjState(st){
+    await chrome.storage.local.set({ gmProjCollector: { ...st, seenProjects: Array.from(st.seenProjects||[]) } });
+  }
 
   function updateProjStatus(text){ if(projStatus) projStatus.textContent=text; }
+  function appendProjLog(line){ try{ if(!projConsole) return; const ts=new Date().toISOString().slice(11,19); const el=document.createElement('div'); el.textContent=`[${ts}] ${line}`; projConsole.appendChild(el); projConsole.scrollTop=projConsole.scrollHeight; }catch(_e){} }
+  function setPhaseUi(phase){
+    try{
+      if(phaseDiscDot) phaseDiscDot.style.background = phase==='discover' ? '#43a047' : '#9e9e9e';
+      if(phaseCollDot) phaseCollDot.style.background = phase==='collect' ? '#43a047' : '#9e9e9e';
+      if(btnProjPause){ btnProjPause.disabled = (phase !== 'collect'); btnProjPause.title = (phase !== 'collect') ? 'Pause is only available during Collect phase' : ''; }
+    }catch(_e){}
+  }
 
   // Utility: wait for a selector to appear in page
   async function waitForSelectorInTab(tabId, selector, timeoutMs=15000){
@@ -2309,50 +2340,98 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
   }
 
   async function delay(ms){ return new Promise(r=>setTimeout(r, ms)); }
-
-  async function runProjCollector(){
-    let st=await getProjState();
-    st.running=true; st.paused=false; st.lastRunAt=new Date().toISOString(); st.throttleMs=(Number(projThrottleSecInput?.value||'7')||7)*1000; st.seenProjects=new Set(st.seenProjects||[]);
-    await setProjState(st); updateProjStatus('running');
-    // Ensure a tab on dashboard
-    let tab=await chrome.tabs.create({ url: st.currentPageUrl||'https://pro.gedmatch.com/', active:true });
-    await waitForTabComplete(tab.id);
-    await waitForSelectorInTab(tab.id,'table.responsive-enabled.table tbody tr');
-    // Page loop: gather project links and enqueue
-    while(st.running && !st.paused){
-      const page=await scrapeDashboardProjects(tab.id);
-      // If no projects found on this page, try advancing pagination and continue
-      if(!page.projects || page.projects.length===0){
-        if(page.next){ st.currentPageUrl=page.next; await chrome.tabs.update(tab.id,{ url: page.next }); await waitForTabComplete(tab.id); await waitForSelectorInTab(tab.id,'table.responsive-enabled.table tbody tr'); continue; }
-      }
-      for(const p of (page.projects||[])){
-        if(!(st.seenProjects instanceof Set)) st.seenProjects=new Set(st.seenProjects||[]);
-        if(!st.seenProjects.has(p.id)){
-          st.queue.push(p); st.seenProjects.add(p.id);
-        }
-      }
-      await setProjState(st);
-      // Process queue items one by one with throttle
-      while(st.running && !st.paused && st.queue.length){
-        const item=st.queue.shift();
-        await chrome.tabs.update(tab.id, { url: item.url }); await waitForTabComplete(tab.id); await waitForSelectorInTab(tab.id,'table.responsive-enabled.table tbody tr');
-        const kits=await scrapeProjectKits(tab.id, item.id);
-        st.results.push(...kits);
-        await setProjState(st); updateProjStatus(`collected ${st.results.length} kit(s); remaining queue ${st.queue.length}`);
-        await delay(st.throttleMs);
-      }
-      if(st.paused || !st.running) break;
-      if(page.next){ st.currentPageUrl=page.next; await chrome.tabs.update(tab.id,{ url: page.next }); await waitForTabComplete(tab.id); await waitForSelectorInTab(tab.id,'table.responsive-enabled.table tbody tr'); }
-      else break;
+  async function delayWithState(ms){
+    const start=Date.now();
+    while(Date.now()-start < ms){
+      const st=await getProjState();
+      if(!st.running) break;
+      if(st.paused) break;
+      const remaining=ms-(Date.now()-start);
+      await delay(Math.min(500, Math.max(50, remaining)));
     }
-    updateProjStatus(st.paused ? 'paused' : 'completed');
-    await setProjState(st);
   }
 
-  btnProjStart?.addEventListener('click', async ()=>{ const st=await getProjState(); st.running=true; st.paused=false; st.currentPageUrl='https://pro.gedmatch.com/'; st.queue=[]; st.seenProjects=new Set(); st.results=[]; await setProjState(st); runProjCollector(); });
-  btnProjPause?.addEventListener('click', async ()=>{ const st=await getProjState(); st.paused=true; st.running=false; await setProjState(st); updateProjStatus('paused'); });
-  btnProjResume?.addEventListener('click', async ()=>{ const st=await getProjState(); st.running=true; st.paused=false; await setProjState(st); runProjCollector(); });
-  btnProjClear?.addEventListener('click', async ()=>{ await chrome.storage.local.remove('gmProjCollector'); updateProjStatus('idle'); });
+  let projRunnerActive=false;
+  async function runProjCollector(){
+    let st=await getProjState();
+    if(projRunnerActive){ appendProjLog('A run is already active; refusing to start another.'); return; }
+    projRunnerActive=true;
+    st.running=true; st.paused=false; st.lastRunAt=new Date().toISOString(); st.throttleMs=(Number(projThrottleSecInput?.value||st.throttleMs||'7')||7)*1000;
+    await setProjState(st); updateProjStatus('running'); setPhaseUi(st.phase);
+    // Open or reuse a tab on current page
+    let tab=await chrome.tabs.create({ url: st.currentPageUrl||'https://pro.gedmatch.com/', active:true });
+    await waitForTabComplete(tab.id);
+    await waitForSelectorInTab(tab.id,'table.responsive-enabled.table');
+    try{
+      // Phase 1: Discover all project links across pagination
+      if(st.phase==='discover'){
+        appendProjLog('Phase 1 (Discover) started');
+        const discoveredMap=new Map((st.discovered||[]).map(p=>[p.id,p]));
+        while(true){
+          st=await getProjState(); if(!st.running){ appendProjLog('Stopped'); break; }
+          const page=await scrapeDashboardProjects(tab.id);
+          const list=page.projects||[];
+          for(const p of list){ if(!discoveredMap.has(p.id)){ discoveredMap.set(p.id, p); appendProjLog(`Discovered project ${p.id}`);} }
+          st.discovered=Array.from(discoveredMap.values());
+          await setProjState(st);
+          // Pause is ignored during discover: allow it to finish quickly
+          if(page.next){
+            const waitMs = 1000 + Math.floor(Math.random()*1000);
+            appendProjLog(`Discover pagination delay: ${(waitMs/1000).toFixed(2)}s`);
+            await delay(waitMs);
+            st.currentPageUrl=page.next; await chrome.tabs.update(tab.id,{ url: page.next }); await waitForTabComplete(tab.id); await waitForSelectorInTab(tab.id,'table.responsive-enabled.table');
+          }
+          else break;
+        }
+        appendProjLog(`Phase 1 complete — ${st.discovered.length} projects discovered`);
+        st.phase='collect'; st.currentPageUrl='https://pro.gedmatch.com/'; st.idx=st.idx||0;
+        await setProjState(st); setPhaseUi(st.phase);
+      }
+      // Phase 2: Collect kits per discovered list, resume-safe by index
+      if(st.phase==='collect'){
+        appendProjLog('Phase 2 (Collect) started');
+        const projects=st.discovered||[];
+        while(true){
+          st=await getProjState(); if(!st.running){ appendProjLog('Stopped'); break; }
+          if(st.paused){ updateProjStatus('paused'); await setProjState(st); await delay(500); continue; }
+          if(st.idx>=projects.length) break;
+          const item=projects[st.idx];
+          appendProjLog(`Collecting ${st.idx+1}/${projects.length}: project ${item.id}`);
+          await chrome.tabs.update(tab.id, { url: item.url }); await waitForTabComplete(tab.id); await waitForSelectorInTab(tab.id,'table.responsive-enabled.table');
+          const kits=await scrapeProjectKits(tab.id, item.id);
+          if(!kits || kits.length===0){ st.results.push({ projectId: item.id, kit: 'NO KIT', caseName: '' }); appendProjLog(`Project ${item.id}: NO KIT`); }
+          else { st.results.push(...kits); for(const k of kits){ appendProjLog(`Project ${k.projectId}: kit ${k.kit} (${k.caseName||'no case'})`); } }
+          st.idx += 1; await setProjState(st); updateProjStatus(`collected ${st.results.length} row(s); index ${st.idx}/${projects.length}`);
+          const minMs=Math.max(0, Number(st.throttleMs)||0); const maxMs=minMs*2; const waitMs=Math.floor(minMs+Math.random()*(maxMs-minMs)); appendProjLog(`Randomized delay selected: ${(waitMs/1000).toFixed(1)}s (min ${(minMs/1000).toFixed(1)}s)`); await delayWithState(waitMs);
+        }
+        st=await getProjState(); if(st.idx>=projects.length){ appendProjLog('Phase 2 complete — all projects processed'); st.running=false; await setProjState(st); }
+      }
+    } finally {
+      updateProjStatus(st.paused ? 'paused' : (st.running ? 'running' : 'completed'));
+      appendProjLog(`Job ${st.paused ? 'paused' : (st.running ? 'running' : 'completed')} — total rows: ${(st.results||[]).length}`);
+      await setProjState(st);
+      projRunnerActive=false;
+    }
+  }
+
+  btnProjStart?.addEventListener('click', async ()=>{
+    let st=await getProjState();
+    if(st.running){ appendProjLog('Already running; ignoring Start'); return; }
+    // Start fresh discover phase
+    st={ ...st, running:false, paused:false, phase:'discover', currentPageUrl:'https://pro.gedmatch.com/', discovered:[], results:[], idx:0 };
+    await setProjState(st);
+    runProjCollector();
+  });
+  btnProjPause?.addEventListener('click', async ()=>{ const st=await getProjState(); if(st.phase!=='collect'){ appendProjLog('Pause is only available during Collect phase'); return; } const newSt={ ...st, paused:true, running:true }; await setProjState(newSt); updateProjStatus('paused'); appendProjLog('Pause requested'); });
+  btnProjResume?.addEventListener('click', async ()=>{ const st=await getProjState(); const newSt={ ...st, running:true, paused:false }; await setProjState(newSt); updateProjStatus('running'); appendProjLog('Resume requested'); if(projRunnerActive){ appendProjLog('Runner active — resuming without restart'); return; } runProjCollector(); });
+  btnProjClear?.addEventListener('click', async ()=>{
+    const ok = confirm('This will clear all saved progress for the Project Kits Collector. Are you sure?');
+    if(!ok){ appendProjLog('Clear cancelled'); return; }
+    await chrome.storage.local.remove('gmProjCollector');
+    updateProjStatus('idle');
+    appendProjLog('State cleared');
+    setPhaseUi('discover');
+  });
   btnProjDownloadCsv?.addEventListener('click', async ()=>{
     const st=await getProjState(); const rows=st.results||[];
     const header=['ProjectId','Kit','CaseName'];
@@ -2403,6 +2482,16 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
       const s=await chrome.storage.local.get(['gmOcn']);
       el.value=(s?.gmOcn||'');
       el.addEventListener('input', async ()=>{ await chrome.storage.local.set({ gmOcn: el.value.trim() }); });
+    }catch(_e){}
+  })();
+
+  // Initialize project collector UI from saved state
+  (async ()=>{
+    try{
+      const st=await getProjState();
+      setPhaseUi(st.phase);
+      updateProjStatus(st.paused ? 'paused' : (st.running ? 'running' : 'idle'));
+      if(projConsole){ appendProjLog(`State loaded — phase=${st.phase}, discovered=${(st.discovered||[]).length}, idx=${st.idx}, results=${(st.results||[]).length}`); }
     }catch(_e){}
   })();
 

@@ -215,6 +215,16 @@
         <button id="btnProjClear" class="btn" style="margin-left:6px;">Clear</button>
         <span id="projStatus" class="pill" style="margin-left:8px;">idle</span>
       </div>
+      <div class="row" style="margin-top:6px; align-items:center; gap:8px;">
+        <span class="muted" style="margin-right:6px;">Status:</span>
+        <span id="phaseDiscDot" title="Discover" style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#9e9e9e;"></span>
+        <span class="muted" style="margin-right:12px;">Discover</span>
+        <span id="phaseCollDot" title="Collect" style="display:inline-block; width:10px; height:10px; border-radius:50%; background:#9e9e9e;"></span>
+        <span class="muted">Collect</span>
+      </div>
+      <div class="row" style="margin-top:8px;">
+        <div id="projConsole" style="background:#000; color:#ff9800; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size: 11px; padding:8px; border-radius:4px; max-height:200px; overflow:auto; white-space: pre-wrap; line-height:1.4;"></div>
+      </div>
     </div>
     
     <div id="panelSettings" class="hidden">
