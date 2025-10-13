@@ -2230,6 +2230,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
   const projConsole=document.getElementById('projConsole');
   const phaseDiscDot=document.getElementById('phaseDiscDot');
   const phaseCollDot=document.getElementById('phaseCollDot');
+  const projDiscCountPill=document.getElementById('projDiscCountPill');
 
   // State persisted in storage to allow resume
   async function getProjState(){
@@ -2256,6 +2257,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
   }
 
   function updateProjStatus(text){ if(projStatus) projStatus.textContent=text; }
+  function updateDiscCount(n){ try{ if(projDiscCountPill) projDiscCountPill.textContent = `Discovered: ${n}`; }catch(_e){} }
   function appendProjLog(line){ try{ if(!projConsole) return; const ts=new Date().toISOString().slice(11,19); const el=document.createElement('div'); el.textContent=`[${ts}] ${line}`; projConsole.appendChild(el); projConsole.scrollTop=projConsole.scrollHeight; }catch(_e){} }
   function setPhaseUi(phase){
     try{
@@ -2361,7 +2363,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
     // Open or reuse a tab on current page
     let tab=await chrome.tabs.create({ url: st.currentPageUrl||'https://pro.gedmatch.com/', active:true });
     await waitForTabComplete(tab.id);
-    await waitForSelectorInTab(tab.id,'table.responsive-enabled.table');
+    await waitForSelectorInTab(tab.id,'table.responsive-enabled.table tbody tr');
     try{
       // Phase 1: Discover all project links across pagination
       if(st.phase==='discover'){
@@ -2369,11 +2371,14 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
         const discoveredMap=new Map((st.discovered||[]).map(p=>[p.id,p]));
         while(true){
           st=await getProjState(); if(!st.running){ appendProjLog('Stopped'); break; }
+          // Ensure rows are present before scrape to avoid partial captures on heavy pages
+          await waitForSelectorInTab(tab.id,'table.responsive-enabled.table tbody tr');
           const page=await scrapeDashboardProjects(tab.id);
           const list=page.projects||[];
           for(const p of list){ if(!discoveredMap.has(p.id)){ discoveredMap.set(p.id, p); appendProjLog(`Discovered project ${p.id}`);} }
           st.discovered=Array.from(discoveredMap.values());
           await setProjState(st);
+          updateDiscCount(st.discovered.length);
           // Pause is ignored during discover: allow it to finish quickly
           if(page.next){
             const waitMs = 1000 + Math.floor(Math.random()*1000);
@@ -2491,6 +2496,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
       const st=await getProjState();
       setPhaseUi(st.phase);
       updateProjStatus(st.paused ? 'paused' : (st.running ? 'running' : 'idle'));
+      updateDiscCount((st.discovered||[]).length);
       if(projConsole){ appendProjLog(`State loaded — phase=${st.phase}, discovered=${(st.discovered||[]).length}, idx=${st.idx}, results=${(st.results||[]).length}`); }
     }catch(_e){}
   })();
