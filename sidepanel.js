@@ -2226,6 +2226,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
   const btnProjResume=document.getElementById('btnProjResume');
   const btnProjDownloadCsv=document.getElementById('btnProjDownloadCsv');
   const btnProjClear=document.getElementById('btnProjClear');
+  const btnProjQuick=document.getElementById('btnProjQuick');
   const projStatus=document.getElementById('projStatus');
   const projConsole=document.getElementById('projConsole');
   const phaseDiscDot=document.getElementById('phaseDiscDot');
@@ -2374,6 +2375,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
       if(st.phase==='discover'){
         appendProjLog('Phase 1 (Discover) started');
         const discoveredMap=new Map((st.discovered||[]).map(p=>[p.id,p]));
+        let pages=0; const testMode = !!(projTestFirst5 && projTestFirst5.checked);
         while(true){
           st=await getProjState(); if(!st.running){ appendProjLog('Stopped'); break; }
           // Ensure rows are present before scrape to avoid partial captures on heavy pages
@@ -2390,6 +2392,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
             appendProjLog(`Discover pagination delay: ${(waitMs/1000).toFixed(2)}s`);
             await delay(waitMs);
             st.currentPageUrl=page.next; await chrome.tabs.update(tab.id,{ url: page.next }); await waitForTabComplete(tab.id); await waitForSelectorInTab(tab.id,'.block-verogen-table-blockyour-projects table.responsive-enabled.table tbody tr');
+            pages += 1; if(testMode && pages>=4){ appendProjLog('Test mode: stopping after 5 pages'); break; }
           }
           else break;
         }
@@ -2451,6 +2454,53 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
     const blob=new Blob([lines.join('\n')], { type:'text/csv' });
     const url=URL.createObjectURL(blob); const name=`gedmatch-project-kits-${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.csv`;
     await chrome.downloads.download({ url, filename: name, saveAs:true }); setTimeout(()=>URL.revokeObjectURL(url), 10000);
+  });
+
+  // Quick Collect: Uses "Your Kits" table (top block) to directly scrape kit and case name
+  btnProjQuick?.addEventListener('click', async ()=>{
+    appendProjLog('Quick Collect started (Your Kits table)');
+    let st=await getProjState(); st.running=false; st.paused=false; await setProjState(st);
+    // Open dashboard
+    let tab=await chrome.tabs.create({ url: 'https://pro.gedmatch.com/?check_logged_in=1', active:true });
+    await waitForTabComplete(tab.id); await waitForSelectorInTab(tab.id,'.block-verogen-table-blockyour-kits table.responsive-enabled.table tbody tr');
+    const allRows=[];
+    let pages=0; const testMode = !!(projTestFirst5 && projTestFirst5.checked);
+    while(true){
+      // Scrape current page rows
+      const [{ result } = {}] = await chrome.scripting.executeScript({ target:{ tabId: tab.id }, func:()=>{
+        const out=[]; const block=document.querySelector('.block-verogen-table-blockyour-kits'); if(!block) return out;
+        const table=block.querySelector('table.responsive-enabled.table'); if(!table) return out;
+        const rows=Array.from(table.querySelectorAll('tbody tr'));
+        for(const tr of rows){
+          const kitCell=tr.querySelector('td:nth-child(3) a');
+          const caseCell=tr.querySelector('td:nth-child(6)');
+          const kit=(kitCell?.textContent||'').trim();
+          const caseName=(caseCell?.textContent||'').trim();
+          out.push({ projectId: '', kit, caseName });
+        }
+        const nextLi=block.querySelector('nav.pager li.pager__item.pager__item--next a');
+        const nextHref=nextLi ? nextLi.getAttribute('href') : null;
+        return { rows: out, next: nextHref ? new URL(nextHref, location.href).toString() : null };
+      }});
+      const pageRes=result||{ rows:[], next:null };
+      for(const r of (pageRes.rows||[])){
+        allRows.push(r);
+        appendProjLog(`QC row: kit ${r.kit || '(blank)'} — case ${r.caseName || '(blank)'}`);
+      }
+      if(pageRes.next){
+        const waitMs=500+Math.floor(Math.random()*700);
+        appendProjLog(`QC pagination delay: ${(waitMs/1000).toFixed(2)}s`);
+        await delay(waitMs);
+        await chrome.tabs.update(tab.id,{ url: pageRes.next }); await waitForTabComplete(tab.id); await waitForSelectorInTab(tab.id,'.block-verogen-table-blockyour-kits table.responsive-enabled.table tbody tr');
+        pages += 1; if(testMode && pages>=4){ appendProjLog('QC test mode: stopping after 5 pages'); break; }
+        continue;
+      }
+      break;
+    }
+    appendProjLog(`Quick Collect finished — ${allRows.length} rows scraped`);
+    // Save into results (non-destructive append)
+    st=await getProjState(); st.results = (st.results||[]).concat(allRows); await setProjState(st);
+    updateProjStatus(`Quick collected ${allRows.length} rows`);
   });
   
   // Settings panel logic
