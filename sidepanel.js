@@ -2284,7 +2284,11 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
   async function scrapeDashboardProjects(tabId){
     const [{ result } = {}] = await chrome.scripting.executeScript({ target:{ tabId }, func:()=>{
       const out={ projects:[], next:null };
-      const tables=Array.from(document.querySelectorAll('table.responsive-enabled.table'));
+      // Scope strictly to the "Your Projects" block to avoid the "Your Kits" block
+      const block=document.querySelector('.block-verogen-table-blockyour-projects');
+      const scope=block||document;
+      // Find the projects table inside the block by header text, fallback to first table in block
+      const tables=Array.from(scope.querySelectorAll('table.responsive-enabled.table'));
       let table=null;
       for(const t of tables){
         const headers=Array.from(t.querySelectorAll('thead th')).map(th=> (th.textContent||'').trim());
@@ -2310,7 +2314,8 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
           }
         }
       }
-      const nextLi=document.querySelector('li.pager__item.pager__item--next');
+      // Find the pager 'next' link inside the same block only
+      const nextLi=(block||document).querySelector('.verogen-table-block-wrapper nav.pager li.pager__item.pager__item--next');
       if(nextLi){
         const a=nextLi.querySelector('a');
         if(a){ out.next=new URL(a.getAttribute('href'), location.href).toString(); }
@@ -2363,7 +2368,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
     // Open or reuse a tab on current page
     let tab=await chrome.tabs.create({ url: st.currentPageUrl||'https://pro.gedmatch.com/', active:true });
     await waitForTabComplete(tab.id);
-    await waitForSelectorInTab(tab.id,'table.responsive-enabled.table tbody tr');
+    await waitForSelectorInTab(tab.id,'.block-verogen-table-blockyour-projects table.responsive-enabled.table tbody tr');
     try{
       // Phase 1: Discover all project links across pagination
       if(st.phase==='discover'){
@@ -2372,7 +2377,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
         while(true){
           st=await getProjState(); if(!st.running){ appendProjLog('Stopped'); break; }
           // Ensure rows are present before scrape to avoid partial captures on heavy pages
-          await waitForSelectorInTab(tab.id,'table.responsive-enabled.table tbody tr');
+          await waitForSelectorInTab(tab.id,'.block-verogen-table-blockyour-projects table.responsive-enabled.table tbody tr');
           const page=await scrapeDashboardProjects(tab.id);
           const list=page.projects||[];
           for(const p of list){ if(!discoveredMap.has(p.id)){ discoveredMap.set(p.id, p); appendProjLog(`Discovered project ${p.id}`);} }
@@ -2384,7 +2389,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
             const waitMs = 1000 + Math.floor(Math.random()*1000);
             appendProjLog(`Discover pagination delay: ${(waitMs/1000).toFixed(2)}s`);
             await delay(waitMs);
-            st.currentPageUrl=page.next; await chrome.tabs.update(tab.id,{ url: page.next }); await waitForTabComplete(tab.id); await waitForSelectorInTab(tab.id,'table.responsive-enabled.table');
+            st.currentPageUrl=page.next; await chrome.tabs.update(tab.id,{ url: page.next }); await waitForTabComplete(tab.id); await waitForSelectorInTab(tab.id,'.block-verogen-table-blockyour-projects table.responsive-enabled.table tbody tr');
           }
           else break;
         }
