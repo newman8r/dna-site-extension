@@ -2560,6 +2560,9 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
   let reportsHalted=false;
   function haltReports(reason){ reportsHalted=true; try{ const lw=document.getElementById('loginWarning'); if(lw) lw.classList.remove('hidden'); }catch(_e){} console.warn('[Reports] halted:', reason); }
   function ensureNotHalted(){ if(reportsHalted) throw new Error('reports-halted'); }
+  // Track skipped kits due to errors
+  let skippedErrors=0;
+  function updateSkippedPill(){ try{ const c=document.getElementById('skippedErrorsCount'); if(c) c.textContent=String(skippedErrors); }catch(_e){} }
   // Auto-save guard to avoid duplicate uploads
   const autoSaveAtlasGuard={ inProgress:false, lastKey:'' };
   // Auto-run state
@@ -2786,6 +2789,77 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
             console.log('[Reports] Visualization Options clicked');
           }catch(e){ console.warn('Visualization Options click failed', e); }
           await waitForTabComplete(tab.id, 30000);
+          // On the visualization page, before doing anything else, detect page-level error messages
+          try{
+            const errRes = await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
+              const msg=document.querySelector('[data-drupal-messages] .alert.alert-error');
+              const text=(msg && (msg.textContent||'').trim())||'';
+              return { has: !!text, text };
+            }});
+            const errInfo = errRes && errRes[0] && errRes[0].result;
+            if(errInfo && errInfo.has){
+              // Skip this kit: send error to Atlas (truncate to 200 chars), increment skipped counter, move to next
+              try{
+                const ocnEl=document.getElementById('ocnInputReports');
+                let ocn = '';
+                try{ ocn=(ocnEl?.value||'').trim(); }catch(_e){}
+                if(!ocn){ try{ const s=await chrome.storage.local.get(['gmOcn']); ocn=(s?.gmOcn||'').trim(); }catch(_e){} }
+                const stored=await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT');
+                const base=(stored && stored.ATLAS_LEGACY_ENDPOINT) ? stored.ATLAS_LEGACY_ENDPOINT : 'https://atlas.othram.com:8080/api';
+                const form=new FormData();
+                form.append('ocn', ocn);
+                form.append('kit', kit);
+                form.append('site','PRO');
+                form.append('status','error');
+                form.append('notes', (errInfo.text||'').slice(0,200));
+                await fetch(`${base}/atlas/legacy/save`, { method:'POST', body: form });
+              }catch(_e){}
+              skippedErrors += 1; updateSkippedPill();
+              // Load next kit if available and auto-run logic applies (reuse existing next-kit block)
+              try{
+                const stored=await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT');
+                const base=(stored && stored.ATLAS_LEGACY_ENDPOINT) ? stored.ATLAS_LEGACY_ENDPOINT : 'https://atlas.othram.com:8080/api';
+                const r=await fetch(`${base}/atlas/legacy/next?site=PRO`, { credentials:'include' });
+                const j=await r.json().catch(()=>({}));
+                if(r.ok && j?.ok && j?.item){
+                  const { kit: nextKit, ocn: nextOcn }=j.item;
+                  // decrement remaining and read delay
+                  try{
+                    const limEl=document.getElementById('autoRunLimit');
+                    const delayEl=document.getElementById('autoRunDelay');
+                    autoRunState.remaining = Math.max(0, parseInt(limEl?.value||'0',10)||0);
+                    autoRunState.delaySec = Math.max(0, parseInt(delayEl?.value||'0',10)||0);
+                    if(autoRunState.remaining>0){ autoRunState.remaining -= 1; if(limEl){ limEl.value=String(autoRunState.remaining); } }
+                  }catch(_e){}
+                  // Fill next values and schedule
+                  try{ const kitEl=document.getElementById('oneToManyKit'); if(kitEl){ kitEl.value=nextKit||''; } }catch(_e){}
+                  try{ const ocnEl2=document.getElementById('ocnInputReports'); if(ocnEl2){ ocnEl2.value=nextOcn||''; await chrome.storage.local.set({ gmOcn: (nextOcn||'').trim() }); } }catch(_e){}
+                  try{ await chrome.storage.local.set({ gmReportsFiles: [] }); renderReportsFiles([]); refreshReportStatus(); updateBundleUi(); }catch(_e){}
+                  if(autoRunState.remaining>0){
+                    if(autoRunState.delaySec>0){
+                      const countdownEl=document.getElementById('autoRunCountdown');
+                      if(countdownEl) countdownEl.classList.remove('hidden');
+                      let secondsLeft=autoRunState.delaySec;
+                      const countdownInterval=setInterval(()=>{
+                        if(countdownEl) countdownEl.textContent=`Starting next run in ${secondsLeft} seconds...`;
+                        secondsLeft--;
+                        if(secondsLeft<0){
+                          clearInterval(countdownInterval);
+                          if(countdownEl) countdownEl.classList.add('hidden');
+                          const runBtn=document.getElementById('btnRunOneToMany'); if(runBtn) runBtn.click();
+                        }
+                      },1000);
+                      if(countdownEl) countdownEl.textContent=`Starting next run in ${secondsLeft} seconds...`;
+                    } else {
+                      setTimeout(()=>{ const runBtn=document.getElementById('btnRunOneToMany'); if(runBtn) runBtn.click(); }, 100);
+                    }
+                  }
+                }
+              }catch(_e){}
+              return; // stop current kit flow entirely
+            }
+          }catch(_e){}
+
           // On the visualization page, click the Search button to run the segment report
           try{
             // Ask background to watch for child tab opened from this tab
