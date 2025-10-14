@@ -2593,7 +2593,34 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
         });
       }catch(_e){}
       await waitForTabComplete(tab.id, 30000);
-      console.log('[Reports] Page loaded, clicking Search button');
+      console.log('[Reports] Page loaded, setting parameters then clicking Search');
+      // Set Limit=1000 and cM size=10 before running one-to-many search
+      try{ ensureNotHalted();
+        const resSet = await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
+          function setSelect(selectors, value){
+            for(const s of selectors){
+              const el=document.querySelector(s);
+              if(el && el.tagName==='SELECT'){
+                const v=String(value);
+                try{
+                  const opts=Array.from(el.options||[]);
+                  if(opts.some(o=>String(o.value)===v)) el.value=v; else el.value=v;
+                }catch(_e){ el.value=v; }
+                el.dispatchEvent(new Event('change', { bubbles:true }));
+                return true;
+              }
+            }
+            return false;
+          }
+          const limitOk=setSelect(['select#edit-limit','select[data-drupal-selector="edit-limit"]'], '1000');
+          const cmOk=setSelect(['select#edit-cm-limit','select[data-drupal-selector="edit-cm-limit"]'], '10');
+          try{ if(typeof Drupal!=='undefined' && Drupal.attachBehaviors){ Drupal.attachBehaviors(document, (window.drupalSettings||{})); } }catch(_e){}
+          return { limitOk, cmOk };
+        }});
+        try{ const r=(resSet&&resSet[0]&&resSet[0].result)||{}; await navLog(kit,{ area:'reports', step:'one-to-many-params-set', limitSet: !!r.limitOk, cmSet: !!r.cmOk }); }catch(_e){}
+      }catch(_e){}
+      
+      // Click Search button
       // Auto-click the Search button on the form
       try{ ensureNotHalted();
         await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
