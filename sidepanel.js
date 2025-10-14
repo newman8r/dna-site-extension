@@ -3401,7 +3401,9 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
         btn.onclick = downloadBundleNow;
         if(btnSave){ btnSave.disabled=false; btnSave.onclick = async ()=>{
           try{
-            const base = (await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT')).ATLAS_LEGACY_ENDPOINT || 'http://localhost:3005';
+            const DEFAULT_ENDPOINT = 'https://atlas.othram.com:8080/api';
+            const stored = await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT');
+            const base = (stored && stored.ATLAS_LEGACY_ENDPOINT) ? stored.ATLAS_LEGACY_ENDPOINT : DEFAULT_ENDPOINT;
             const { blob, filename } = await buildBundleZip();
             const form=new FormData();
             form.append('ocn', ocn);
