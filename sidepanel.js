@@ -2638,11 +2638,18 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
           renderReportsLog();
       }catch(e){ if(String(e?.message||'')!=='reports-halted'){ console.warn('Auto-click failed', e); } }
       await waitForTabComplete(tab.id, 30000);
-      // After search completes, check for inline error message (e.g., access denied)
+      // After search completes, check for error messages on the page (Drupal messages or inline error)
       try{
         const resErr = await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
-          const el=document.querySelector('.form-item--error-message');
-          const txt=(el && (el.textContent||'').trim())||'';
+          const inlineEl=document.querySelector('.form-item--error-message');
+          const inlineTxt=(inlineEl && (inlineEl.textContent||'').trim())||'';
+          const msgBox=document.querySelector('[data-drupal-messages] .alert.alert-error');
+          let msgTxt='';
+          if(msgBox){
+            const roleDiv=msgBox.querySelector('[role="alert"]')||msgBox;
+            msgTxt=(roleDiv && (roleDiv.textContent||'').replace(/\s+/g,' ').trim())||'';
+          }
+          const txt = inlineTxt || msgTxt;
           return { has: !!txt, text: txt };
         }});
         const errInfo = resErr && resErr[0] && resErr[0].result;
@@ -2656,11 +2663,14 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
             let ocn = '';
             try{ ocn=(ocnEl?.value||'').trim(); }catch(_e){}
             if(!ocn){ try{ const s=await chrome.storage.local.get(['gmOcn']); ocn=(s?.gmOcn||'').trim(); }catch(_e){} }
-            const base=(await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT')).ATLAS_LEGACY_ENDPOINT || 'https://atlas.othram.com:8080/api';
+            const stored=await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT');
+            const base=(stored && stored.ATLAS_LEGACY_ENDPOINT) ? stored.ATLAS_LEGACY_ENDPOINT : 'https://atlas.othram.com:8080/api';
             const form=new FormData(); form.append('ocn', ocn); form.append('kit', kit); form.append('site','PRO'); form.append('status','error'); form.append('notes', errInfo.text||'');
             const resp=await fetch(`${base}/atlas/legacy/save`, { method:'POST', body: form });
             const data=await resp.json().catch(()=>({}));
             if(resp.ok && data?.ok){
+              // increment skipped error counter
+              try{ skippedErrors += 1; updateSkippedPill(); }catch(_e){}
               // auto-fill next and auto-run based on limit/delay
               try{
                 try{ const nm=document.getElementById('noMoreKitsMsg'); if(nm) nm.classList.add('hidden'); }catch(_e){}
