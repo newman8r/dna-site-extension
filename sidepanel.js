@@ -2574,6 +2574,8 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
       const kit=(kitInput.value||'').trim(); if(!kit){ alert('Enter a Kit ID first.'); return; }
       reportsHalted=false;
       let retriedOptOut=false; // Reset for each kit run
+      let optedOutKits=null; // Set of kit IDs that opted out of LE (parsed from error)
+      let needsAdditionalSegments=false; // true when we need to capture opted-in segments
       // Clear previous report artifacts to ensure a clean 3-file run (one, seg, ak)
       try{
         await chrome.storage.local.set({ gmReportsFiles: [] });
@@ -2820,6 +2822,18 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
               try{ await navLog(kit,{ area:'reports', step:'visualization-page-error', msg:msgText.slice(0,100) }); }catch(_e){}
               const isOptOut=/opted out of Law Enforcement/i.test(msgText);
               if(isOptOut && !retriedOptOut){
+                // Parse the opted-out kit list from the error message
+                try{
+                  const match = /opted out of Law Enforcement[^:]*:\s*([A-Z0-9,\s]+?)\s*\(Use the back button/i.exec(msgText);
+                  if(match && match[1]){
+                    const kitsStr = match[1];
+                    const kits = kitsStr.split(/[,\s]+/).map(k=>k.trim()).filter(k=>k && /^[A-Z0-9]+$/i.test(k));
+                    optedOutKits = new Set(kits);
+                    needsAdditionalSegments = true;
+                    console.log('[Reports] Parsed', optedOutKits.size, 'opted-out kits');
+                    try{ await navLog(kit,{ area:'reports', step:'optout-kits-parsed', count:optedOutKits.size }); }catch(_e){}
+                  }
+                }catch(_e){ console.warn('[Reports] Failed to parse opted-out kits:', _e); }
                 // First time: retry by unchecking Othram
                 retriedOptOut=true;
                 console.log('[Reports] Opt-out error - going back to uncheck Othram kits');
@@ -3129,13 +3143,130 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
                 renderReportsFiles(files);
                 await refreshReportStatus();
                 await updateBundleUi();
-                // Auto-run Auto-Kinship now that segments CSV is saved
+                try{ await navLog(kit,{ area:'reports', step:'segments-fetched', filename:name, bytes: bytes.length }); }catch(_e){}
+                renderReportsLog();
+                
+                // Check if we need to capture additional segments (opted-in kits only)
+                if(needsAdditionalSegments && optedOutKits && optedOutKits.size > 0){
+                  try{
+                    needsAdditionalSegments = false; // prevent infinite loop
+                    console.log('[Reports] Starting additional segments capture with opted-in kits only');
+                    try{ await navLog(kit,{ area:'reports', step:'additional-segments-start', optedOutCount: optedOutKits.size }); }catch(_e){}
+                    
+                    // Navigate to one-to-many results page directly (more reliable than history.back from segment results)
+                    const resultsUrl = `https://pro.gedmatch.com/tools/one-to-many-segment-based?kit_num=${encodeURIComponent(kit)}`;
+                    try{ await chrome.tabs.update(tab.id, { url: resultsUrl }); }catch(_e){}
+                    await waitForTabComplete(tab.id, 30000);
+                    // Click Search to get results again
+                    try{
+                      await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{ const btn=document.querySelector('button#edit-submit.js-form-submit'); if(btn){ btn.click(); } }});
+                      await waitForTabComplete(tab.id, 30000);
+                    }catch(_e){}
+                    try{ const activeBack=await getActiveGedmatchTabId(tab.id); if(activeBack!==tab.id){ tab.id=activeBack; } }catch(_e){}
+                    try{ await navLog(kit,{ area:'reports', step:'additional-segments-on-results-page' }); }catch(_e){}
+                    
+                    // Select cases@othram.com + up to 10 opted-in kits
+                    const optedOutArray = Array.from(optedOutKits);
+                    try{
+                      const selRes = await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, args:[optedOutArray], func:(optedOut)=>{
+                        const optedOutSet = new Set(optedOut.map(k=>k.toUpperCase()));
+                        const emailNeedle = 'cases@othram.com';
+                        let selected=0, othramSelected=0, nonOthramSelected=0;
+                        
+                        // First: uncheck all
+                        try{ const selAll=document.querySelector('input.form-checkbox[title="Select all rows in this table"]'); if(selAll && selAll.checked){ selAll.click(); selAll.checked=false; selAll.dispatchEvent(new Event('change',{bubbles:true})); } }catch(_e){}
+                        
+                        const rows = Array.from(document.querySelectorAll('table tbody tr'));
+                        
+                        // Second: check all Othram rows
+                        for(const tr of rows){
+                          const txt = (tr.textContent||'').toLowerCase();
+                          if(txt.includes(emailNeedle)){
+                            const cb = tr.querySelector('input.form-checkbox');
+                            if(cb && !cb.checked){ cb.click(); cb.checked=true; cb.dispatchEvent(new Event('change',{bubbles:true})); othramSelected++; selected++; }
+                          }
+                        }
+                        
+                        // Third: check up to 10 non-opted-out, non-Othram kits
+                        for(const tr of rows){
+                          if(nonOthramSelected >= 10) break;
+                          const txt = tr.textContent||'';
+                          const txtLow = txt.toLowerCase();
+                          if(txtLow.includes(emailNeedle)) continue; // already selected
+                          const kitMatch = /\b([A-Z]{1,2}[0-9]{5,8})\b/i.exec(txt);
+                          if(!kitMatch) continue;
+                          const kitId = kitMatch[1].toUpperCase();
+                          if(optedOutSet.has(kitId)) continue; // skip opted-out
+                          const cb = tr.querySelector('input.form-checkbox');
+                          if(cb && !cb.checked){ cb.click(); cb.checked=true; cb.dispatchEvent(new Event('change',{bubbles:true})); nonOthramSelected++; selected++; }
+                        }
+                        
+                        try{ if(typeof Drupal!=='undefined' && Drupal.attachBehaviors){ Drupal.attachBehaviors(document, (window.drupalSettings||{})); } }catch(_e){}
+                        return { selected, othramSelected, nonOthramSelected };
+                      }});
+                      const selResult=(selRes&&selRes[0]&&selRes[0].result)||{};
+                      console.log('[Reports] Additional segments selection:', selResult);
+                      try{ await navLog(kit,{ area:'reports', step:'additional-segments-selection', total:selResult.selected||0, othram:selResult.othramSelected||0, nonOthram:selResult.nonOthramSelected||0 }); }catch(_e){}
+                    }catch(_e){ console.warn('[Reports] Additional segments selection failed:', _e); }
+                    
+                    // Click Visualization Options again
+                    try{ await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{ const vis=document.querySelector('#edit-multi-kit-analysis-submit'); if(vis){ vis.click(); } }}); }catch(_e){}
+                    try{ await navLog(kit,{ area:'reports', step:'additional-segments-vis-click' }); }catch(_e){}
+                    await waitForTabComplete(tab.id, 30000);
+                    try{ const activeVis=await getActiveGedmatchTabId(tab.id); if(activeVis!==tab.id){ tab.id=activeVis; } }catch(_e){}
+                    
+                    // Click segment Search button
+                    try{ await new Promise(res=>chrome.runtime.sendMessage({ type:'gm:watchChildTabs', parentTabId: tab.id }, ()=>res())); }catch(_e){}
+                    try{
+                      let clicked=false; let tries=0;
+                      while(!clicked && tries++<5){
+                        const exec = await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{ const b1=document.querySelector('button#edit-submit--2.button.js-form-submit'); const b2=document.querySelector('button#edit-submit.button.js-form-submit'); const b3=document.querySelector('button[data-drupal-selector="edit-submit"].js-form-submit'); const btn=b1||b2||b3; if(btn){ btn.click(); return { clicked:true }; } const i1=document.querySelector('input#edit-submit--2[type="submit"]'); const i2=document.querySelector('input#edit-submit[type="submit"]'); const i3=document.querySelector('input[data-drupal-selector="edit-submit"][type="submit"]'); const alt=i1||i2||i3; if(alt){ alt.click(); return { clicked:true, alt:true }; } return { clicked:false }; }});
+                        clicked = !!(exec && exec[0] && exec[0].result && exec[0].result.clicked);
+                        if(!clicked){ await new Promise(r=>setTimeout(r, 500)); }
+                      }
+                      try{ await navLog(kit,{ area:'reports', step:'additional-segments-search-clicked' }); }catch(_e){}
+                    }catch(_e){}
+                    await waitForTabComplete(tab.id, 30000);
+                    
+                    // Adopt results tab
+                    try{ const s2=await chrome.storage.local.get(['gmSegmentResultsTabId']); if(s2.gmSegmentResultsTabId && s2.gmSegmentResultsTabId!==tab.id){ const oldId=tab.id; tab.id=s2.gmSegmentResultsTabId; try{ await chrome.tabs.remove(oldId); }catch(_e){} } }catch(_e){}
+                    try{ const activeAfter=await getActiveGedmatchTabId(tab.id); if(activeAfter!==tab.id){ tab.id=activeAfter; } }catch(_e){}
+                    
+                    // Download additional segments CSV
+                    await new Promise(r=>setTimeout(r, 3000));
+                    try{
+                      const submitInfo2Arr = await chrome.scripting.executeScript({ target:{ tabId: tab.id }, func: async ()=>{ try{ const btn=document.querySelector('#edit-download-csv, [data-drupal-selector="edit-download-csv"]'); const form=btn?.form || btn?.closest('form'); if(!form) return { ok:false, error:'no-form' }; const fd=new FormData(form); fd.set(btn.name||'op', btn.value||'Download CSV'); const action=form.action||location.href; const resp=await fetch(action, { method:'POST', body: fd, credentials:'include' }); const text=await resp.text(); let link=''; try{ const json=JSON.parse(text); if(Array.isArray(json)){ for(const cmd of json){ const command=(cmd?.command||'').toLowerCase(); if(command==='insert'){ const html = cmd?.data?.markup || cmd?.data || ''; if(typeof html==='string'){ const m = html.match(/href\s*=\s*"([^"]+\.csv[^"]*)"/i); if(m){ link = new URL(m[1], location.origin).toString(); break; } } } } } }catch(_e){} if(!link){ try{ const doc=new DOMParser().parseFromString(text, 'text/html'); const a1=[...doc.querySelectorAll('a')].find(a=>(a.textContent||'').trim()==='Click here to download file.'); const a2=a1 || [...doc.querySelectorAll('a[href]')].find(a=>/\.csv(\?|$)/i.test(a.getAttribute('href')||a.href||'')); if(a2){ const href=a2.getAttribute('href')||a2.href||''; link = href && /^https?:/i.test(href) ? href : (href ? (new URL(href, location.origin).toString()) : ''); } }catch(_e){} } return { ok:Boolean(link), link, submitted:true }; }catch(e){ return { ok:false, error:String(e) }; } }});
+                      const submitInfo2 = submitInfo2Arr && submitInfo2Arr[0] && submitInfo2Arr[0].result;
+                      if(submitInfo2?.ok && submitInfo2.link){
+                        const resp2 = await fetch(submitInfo2.link, { credentials:'include' });
+                        const blob2 = await resp2.blob();
+                        const buf2 = await blob2.arrayBuffer();
+                        const bytes2 = new Uint8Array(buf2);
+                        const store2 = await chrome.storage.local.get(['gmReportsFiles']);
+                        const files2 = Array.isArray(store2.gmReportsFiles) ? store2.gmReportsFiles : [];
+                        files2.unshift({ name: 'additional-segments.csv', data: Array.from(bytes2), savedAt: new Date().toISOString(), sourceUrl: submitInfo2.link, kind: 'additional-segments' });
+                        await chrome.storage.local.set({ gmReportsFiles: files2 });
+                        renderReportsFiles(files2);
+                        await refreshReportStatus();
+                        await updateBundleUi();
+                        console.log('[Reports] Additional segments CSV captured successfully');
+                        try{ await navLog(kit,{ area:'reports', step:'additional-segments-fetched', bytes: bytes2.length }); }catch(_e){}
+                      } else {
+                        console.warn('[Reports] Additional segments link not found - proceeding without it');
+                        try{ await navLog(kit,{ area:'reports', step:'additional-segments-link-not-found' }); }catch(_e){}
+                      }
+                    }catch(_e){ 
+                      console.warn('[Reports] Additional segments capture failed - proceeding without it:', _e); 
+                      try{ await navLog(kit,{ area:'reports', step:'additional-segments-error', error:String(_e) }); }catch(_e2){}
+                    }
+                  }catch(_e){ console.warn('[Reports] Additional segments flow skipped:', _e); }
+                }
+                
+                // Continue to Auto-Kinship
                 try{
                   const kitVal=(document.getElementById('oneToManyKit')?.value||'').trim();
                   if(kitVal){ runAutoKinshipFlow(kitVal).catch(()=>{}); }
                 }catch(_e){}
-                try{ await navLog(kit,{ area:'reports', step:'segments-fetched', filename:name, bytes: bytes.length }); }catch(_e){}
-                renderReportsLog();
                 return; // Done
               }
             }catch(e){ console.warn('POST-parse extraction failed', e); }
