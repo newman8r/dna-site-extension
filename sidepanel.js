@@ -2566,13 +2566,15 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
   // Auto-save guard to avoid duplicate uploads
   const autoSaveAtlasGuard={ inProgress:false, lastKey:'' };
   // Auto-run state
-  const autoRunState={ remaining:0, delaySec:0, running:false };
+  const autoRunState={ remaining:0, delaySec:0, running:false, userInitiated:false };
   const btnRun=document.getElementById('btnRunOneToMany');
   const kitInput=document.getElementById('oneToManyKit');
   if(btnRun&&kitInput){
     btnRun.onclick = async () => {
       const kit=(kitInput.value||'').trim(); if(!kit){ alert('Enter a Kit ID first.'); return; }
       reportsHalted=false;
+      // Only mark as user-initiated if it wasn't triggered by countdown
+      if(autoRunState.userInitiated !== false) autoRunState.userInitiated = true;
       let retriedOptOut=false; // Reset for each kit run
       let optedOutKits=null; // Set of kit IDs that opted out of LE (parsed from error)
       let needsAdditionalSegments=false; // true when we need to capture opted-in segments
@@ -2694,7 +2696,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
                   try{ const ocnEl2=document.getElementById('ocnInputReports'); if(ocnEl2){ ocnEl2.value=nextOcn||''; await chrome.storage.local.set({ gmOcn: (nextOcn||'').trim() }); } }catch(_e){}
                   // schedule next run if remaining>0 with countdown display
                   try{
-                    if(autoRunState.remaining>0 && autoRunState.delaySec>0){
+                    if(!autoRunState.userInitiated && autoRunState.remaining>0 && autoRunState.delaySec>0){
                       // Show countdown timer
                       const countdownEl = document.getElementById('autoRunCountdown');
                       if(countdownEl) countdownEl.classList.remove('hidden');
@@ -2705,16 +2707,18 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
                         if(secondsLeft < 0){
                           clearInterval(countdownInterval);
                           if(countdownEl) countdownEl.classList.add('hidden');
-                          // Actually click the Run One-to-Many button
+                          // Actually click the Run One-to-Many button (mark as auto-triggered)
+                          autoRunState.userInitiated = false;
                           const runBtn = document.getElementById('btnRunOneToMany');
                           if(runBtn) runBtn.click();
                         }
                       }, 1000);
                       // Show initial message immediately
                       if(countdownEl) countdownEl.textContent = `Starting next run in ${secondsLeft} seconds...`;
-                    } else if(autoRunState.remaining>0){
+                    } else if(!autoRunState.userInitiated && autoRunState.remaining>0){
                       // No delay, run immediately
                       setTimeout(()=>{
+                        autoRunState.userInitiated = false;
                         const runBtn = document.getElementById('btnRunOneToMany');
                         if(runBtn) runBtn.click();
                       }, 100);
@@ -3767,7 +3771,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
                   try{ await chrome.storage.local.set({ gmReportsFiles: [] }); renderReportsFiles([]); refreshReportStatus(); updateBundleUi(); }catch(_e){}
                   // schedule next run if remaining>0 with countdown display
                   try{
-                    if(autoRunState.remaining>0 && autoRunState.delaySec>0){
+                    if(!autoRunState.userInitiated && autoRunState.remaining>0 && autoRunState.delaySec>0){
                       // Show countdown timer
                       const countdownEl = document.getElementById('autoRunCountdown');
                       if(countdownEl) countdownEl.classList.remove('hidden');
@@ -3778,16 +3782,18 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
                         if(secondsLeft < 0){
                           clearInterval(countdownInterval);
                           if(countdownEl) countdownEl.classList.add('hidden');
-                          // Actually click the Run One-to-Many button
+                          // Actually click the Run One-to-Many button (mark as auto-triggered)
+                          autoRunState.userInitiated = false;
                           const runBtn = document.getElementById('btnRunOneToMany');
                           if(runBtn) runBtn.click();
                         }
                       }, 1000);
                       // Show initial message immediately
                       if(countdownEl) countdownEl.textContent = `Starting next run in ${secondsLeft} seconds...`;
-                    } else if(autoRunState.remaining>0){
+                    } else if(!autoRunState.userInitiated && autoRunState.remaining>0){
                       // No delay, run immediately
                       setTimeout(()=>{
+                        autoRunState.userInitiated = false;
                         const runBtn = document.getElementById('btnRunOneToMany');
                         if(runBtn) runBtn.click();
                       }, 100);
