@@ -2573,6 +2573,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
     btnRun.onclick = async () => {
       const kit=(kitInput.value||'').trim(); if(!kit){ alert('Enter a Kit ID first.'); return; }
       reportsHalted=false;
+      let retriedOptOut=false; // Reset for each kit run
       // Clear previous report artifacts to ensure a clean 3-file run (one, seg, ak)
       try{
         await chrome.storage.local.set({ gmReportsFiles: [] });
@@ -2799,76 +2800,84 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
             console.log('[Reports] Visualization Options clicked');
           }catch(e){ console.warn('Visualization Options click failed', e); }
           await waitForTabComplete(tab.id, 30000);
-          // On the visualization page, before doing anything else, detect page-level error messages
+          // The Visualization Options action may have opened a new tab; prefer the active GEDmatch tab
+          try{ const activeId=await getActiveGedmatchTabId(tab.id); if(activeId!==tab.id){ console.log('[Reports] Using active GEDmatch tab after vis options:', activeId); tab.id=activeId; } }catch(_e){}
+          
+          // Check for error on the visualization page (opt-out error appears HERE, before Search button exists)
+          let skipToNextKit=false;
           try{
+            await new Promise(r=>setTimeout(r, 1500)); // Let error render
             const errRes = await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
               const msg=document.querySelector('[data-drupal-messages] .alert.alert-error');
-              const text=(msg && (msg.textContent||'').trim())||'';
+              const role=msg?.querySelector('[role="alert"]')||msg;
+              const text=(role && (role.textContent||'').replace(/\s+/g,' ').trim())||'';
               return { has: !!text, text };
             }});
             const errInfo = errRes && errRes[0] && errRes[0].result;
             if(errInfo && errInfo.has){
-              // Skip this kit: send error to Atlas (truncate to 200 chars), increment skipped counter, move to next
-              try{
-                const ocnEl=document.getElementById('ocnInputReports');
-                let ocn = '';
-                try{ ocn=(ocnEl?.value||'').trim(); }catch(_e){}
-                if(!ocn){ try{ const s=await chrome.storage.local.get(['gmOcn']); ocn=(s?.gmOcn||'').trim(); }catch(_e){} }
-                const stored=await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT');
-                const base=(stored && stored.ATLAS_LEGACY_ENDPOINT) ? stored.ATLAS_LEGACY_ENDPOINT : 'https://atlas.othram.com:8080/api';
-                const form=new FormData();
-                form.append('ocn', ocn);
-                form.append('kit', kit);
-                form.append('site','PRO');
-                form.append('status','error');
-                form.append('notes', (errInfo.text||'').slice(0,200));
-                await fetch(`${base}/atlas/legacy/save`, { method:'POST', body: form });
-              }catch(_e){}
-              skippedErrors += 1; updateSkippedPill();
-              // Load next kit if available and auto-run logic applies (reuse existing next-kit block)
-              try{
-                const stored=await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT');
-                const base=(stored && stored.ATLAS_LEGACY_ENDPOINT) ? stored.ATLAS_LEGACY_ENDPOINT : 'https://atlas.othram.com:8080/api';
-                const r=await fetch(`${base}/atlas/legacy/next?site=PRO`, { credentials:'include' });
-                const j=await r.json().catch(()=>({}));
-                if(r.ok && j?.ok && j?.item){
-                  const { kit: nextKit, ocn: nextOcn }=j.item;
-                  // decrement remaining and read delay
-                  try{
-                    const limEl=document.getElementById('autoRunLimit');
-                    const delayEl=document.getElementById('autoRunDelay');
-                    autoRunState.remaining = Math.max(0, parseInt(limEl?.value||'0',10)||0);
-                    autoRunState.delaySec = Math.max(0, parseInt(delayEl?.value||'0',10)||0);
-                    if(autoRunState.remaining>0){ autoRunState.remaining -= 1; if(limEl){ limEl.value=String(autoRunState.remaining); } }
-                  }catch(_e){}
-                  // Fill next values and schedule
-                  try{ const kitEl=document.getElementById('oneToManyKit'); if(kitEl){ kitEl.value=nextKit||''; } }catch(_e){}
-                  try{ const ocnEl2=document.getElementById('ocnInputReports'); if(ocnEl2){ ocnEl2.value=nextOcn||''; await chrome.storage.local.set({ gmOcn: (nextOcn||'').trim() }); } }catch(_e){}
-                  try{ await chrome.storage.local.set({ gmReportsFiles: [] }); renderReportsFiles([]); refreshReportStatus(); updateBundleUi(); }catch(_e){}
-                  if(autoRunState.remaining>0){
-                    if(autoRunState.delaySec>0){
-                      const countdownEl=document.getElementById('autoRunCountdown');
-                      if(countdownEl) countdownEl.classList.remove('hidden');
-                      let secondsLeft=autoRunState.delaySec;
-                      const countdownInterval=setInterval(()=>{
-                        if(countdownEl) countdownEl.textContent=`Starting next run in ${secondsLeft} seconds...`;
-                        secondsLeft--;
-                        if(secondsLeft<0){
-                          clearInterval(countdownInterval);
-                          if(countdownEl) countdownEl.classList.add('hidden');
-                          const runBtn=document.getElementById('btnRunOneToMany'); if(runBtn) runBtn.click();
-                        }
-                      },1000);
-                      if(countdownEl) countdownEl.textContent=`Starting next run in ${secondsLeft} seconds...`;
-                    } else {
-                      setTimeout(()=>{ const runBtn=document.getElementById('btnRunOneToMany'); if(runBtn) runBtn.click(); }, 100);
-                    }
+              const msgText=String(errInfo.text||'');
+              console.log('[Reports] Error on visualization page:', msgText.slice(0,100));
+              try{ await navLog(kit,{ area:'reports', step:'visualization-page-error', msg:msgText.slice(0,100) }); }catch(_e){}
+              const isOptOut=/opted out of Law Enforcement/i.test(msgText);
+              if(isOptOut && !retriedOptOut){
+                // First time: retry by unchecking Othram
+                retriedOptOut=true;
+                console.log('[Reports] Opt-out error - going back to uncheck Othram kits');
+                try{ await navLog(kit,{ area:'reports', step:'optout-retry-going-back' }); }catch(_e){}
+                try{ await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{ history.back(); }}); }catch(_e){}
+                await waitForTabComplete(tab.id, 30000);
+                try{ const activeBack=await getActiveGedmatchTabId(tab.id); if(activeBack!==tab.id){ tab.id=activeBack; } }catch(_e){}
+                try{
+                  const adjustRes = await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
+                    const emailNeedle='cases@othram.com';
+                    let unchecked=0;
+                    try{ const selAll=document.querySelector('input.form-checkbox[title="Select all rows in this table"]'); if(selAll && !selAll.checked){ selAll.click(); selAll.checked=true; selAll.dispatchEvent(new Event('change',{bubbles:true})); } }catch(_e){}
+                    const rows=Array.from(document.querySelectorAll('table tbody tr'));
+                    for(const tr of rows){ const txt=(tr.textContent||'').toLowerCase(); if(txt.includes(emailNeedle)){ const cb=tr.querySelector('input.form-checkbox'); if(cb && cb.checked){ cb.click(); cb.checked=false; cb.dispatchEvent(new Event('change',{bubbles:true})); unchecked++; } } }
+                    try{ if(typeof Drupal!=='undefined' && Drupal.attachBehaviors){ Drupal.attachBehaviors(document, (window.drupalSettings||{})); } }catch(_e){}
+                    return { unchecked };
+                  }});
+                  const uncheckResult=(adjustRes&&adjustRes[0]&&adjustRes[0].result)||{};
+                  console.log('[Reports] Unchecked', uncheckResult.unchecked||0, 'Othram rows');
+                  try{ await navLog(kit,{ area:'reports', step:'optout-rows-unchecked', count:uncheckResult.unchecked||0 }); }catch(_e){}
+                }catch(_e){}
+                // Re-click Visualization Options - this will reload the vis page
+                try{ await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{ const vis=document.querySelector('#edit-multi-kit-analysis-submit'); if(vis){ vis.click(); } }}); }catch(_e){}
+                try{ await navLog(kit,{ area:'reports', step:'vis-options-retry-clicked' }); }catch(_e){}
+                await waitForTabComplete(tab.id, 30000);
+                try{ const activeRetry=await getActiveGedmatchTabId(tab.id); if(activeRetry!==tab.id){ tab.id=activeRetry; } }catch(_e){}
+                // Check once more for error after retry
+                await new Promise(r=>setTimeout(r, 1500));
+                try{
+                  const errRes3 = await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{ const msg=document.querySelector('[data-drupal-messages] .alert.alert-error'); const role=msg?.querySelector('[role="alert"]')||msg; const text=(role && (role.textContent||'').replace(/\s+/g,' ').trim())||''; return { has: !!text, text }; }});
+                  const errInfo3 = errRes3 && errRes3[0] && errRes3[0].result;
+                  if(errInfo3 && errInfo3.has){
+                    // Still error after retry - skip kit
+                    skipToNextKit=true;
+                    console.log('[Reports] Error persists after retry - skipping kit');
+                    try{ await navLog(kit,{ area:'reports', step:'optout-retry-still-failed', msg:(errInfo3.text||'').slice(0,100) }); }catch(_e){}
+                    try{ const ocnEl=document.getElementById('ocnInputReports'); let ocn=''; try{ ocn=(ocnEl?.value||'').trim(); }catch(_e){} if(!ocn){ try{ const s=await chrome.storage.local.get(['gmOcn']); ocn=(s?.gmOcn||'').trim(); }catch(_e){} } const stored=await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT'); const base=(stored && stored.ATLAS_LEGACY_ENDPOINT) ? stored.ATLAS_LEGACY_ENDPOINT : 'https://atlas.othram.com:8080/api'; const form=new FormData(); form.append('ocn', ocn); form.append('kit', kit); form.append('site','PRO'); form.append('status','error'); form.append('notes', (errInfo3.text||'').slice(0,200)); await fetch(`${base}/atlas/legacy/save`, { method:'POST', body: form }); }catch(_e){}
+                    skippedErrors += 1; updateSkippedPill();
+                    try{ const stored=await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT'); const base=(stored && stored.ATLAS_LEGACY_ENDPOINT) ? stored.ATLAS_LEGACY_ENDPOINT : 'https://atlas.othram.com:8080/api'; const r=await fetch(`${base}/atlas/legacy/next?site=PRO`, { credentials:'include' }); const j=await r.json().catch(()=>({})); if(r.ok && j?.ok && j?.item){ const { kit: nextKit, ocn: nextOcn }=j.item; try{ const limEl=document.getElementById('autoRunLimit'); const delayEl=document.getElementById('autoRunDelay'); autoRunState.remaining=Math.max(0, parseInt(limEl?.value||'0',10)||0); autoRunState.delaySec=Math.max(0, parseInt(delayEl?.value||'0',10)||0); if(autoRunState.remaining>0){ autoRunState.remaining -= 1; if(limEl){ limEl.value=String(autoRunState.remaining); } } }catch(_e){} try{ const kitEl=document.getElementById('oneToManyKit'); if(kitEl){ kitEl.value=nextKit||''; } }catch(_e){} try{ const ocnEl2=document.getElementById('ocnInputReports'); if(ocnEl2){ ocnEl2.value=nextOcn||''; await chrome.storage.local.set({ gmOcn: (nextOcn||'').trim() }); } }catch(_e){} try{ await chrome.storage.local.set({ gmReportsFiles: [] }); renderReportsFiles([]); refreshReportStatus(); updateBundleUi(); }catch(_e){} if(autoRunState.remaining>0){ if(autoRunState.delaySec>0){ const countdownEl=document.getElementById('autoRunCountdown'); if(countdownEl) countdownEl.classList.remove('hidden'); let secondsLeft=autoRunState.delaySec; const countdownInterval=setInterval(()=>{ if(countdownEl) countdownEl.textContent=`Starting next run in ${secondsLeft} seconds...`; secondsLeft--; if(secondsLeft<0){ clearInterval(countdownInterval); if(countdownEl) countdownEl.classList.add('hidden'); const runBtn=document.getElementById('btnRunOneToMany'); if(runBtn) runBtn.click(); } },1000); if(countdownEl) countdownEl.textContent=`Starting next run in ${secondsLeft} seconds...`; } else { setTimeout(()=>{ const runBtn=document.getElementById('btnRunOneToMany'); if(runBtn) runBtn.click(); }, 100); } } } }catch(_e){}
+                  } else {
+                    // No error after retry - success!
+                    console.log('[Reports] Success - no error after retry, proceeding to segment search');
+                    try{ await navLog(kit,{ area:'reports', step:'optout-retry-success' }); }catch(_e){}
                   }
-                }
-              }catch(_e){}
-              return; // stop current kit flow entirely
+                }catch(_e){}
+                // Fall through to segment search (if no error after retry)
+              } else {
+                // Not opt-out error - skip kit immediately
+                skipToNextKit=true;
+                console.log('[Reports] Non-opt-out error - skipping kit');
+                try{ await navLog(kit,{ area:'reports', step:'vis-page-error-skip', msg:msgText.slice(0,100) }); }catch(_e){}
+                try{ const ocnEl=document.getElementById('ocnInputReports'); let ocn=''; try{ ocn=(ocnEl?.value||'').trim(); }catch(_e){} if(!ocn){ try{ const s=await chrome.storage.local.get(['gmOcn']); ocn=(s?.gmOcn||'').trim(); }catch(_e){} } const stored=await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT'); const base=(stored && stored.ATLAS_LEGACY_ENDPOINT) ? stored.ATLAS_LEGACY_ENDPOINT : 'https://atlas.othram.com:8080/api'; const form=new FormData(); form.append('ocn', ocn); form.append('kit', kit); form.append('site','PRO'); form.append('status','error'); form.append('notes', msgText.slice(0,200)); await fetch(`${base}/atlas/legacy/save`, { method:'POST', body: form }); }catch(_e){}
+                skippedErrors += 1; updateSkippedPill();
+                try{ const stored=await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT'); const base=(stored && stored.ATLAS_LEGACY_ENDPOINT) ? stored.ATLAS_LEGACY_ENDPOINT : 'https://atlas.othram.com:8080/api'; const r=await fetch(`${base}/atlas/legacy/next?site=PRO`, { credentials:'include' }); const j=await r.json().catch(()=>({})); if(r.ok && j?.ok && j?.item){ const { kit: nextKit, ocn: nextOcn }=j.item; try{ const limEl=document.getElementById('autoRunLimit'); const delayEl=document.getElementById('autoRunDelay'); autoRunState.remaining=Math.max(0, parseInt(limEl?.value||'0',10)||0); autoRunState.delaySec=Math.max(0, parseInt(delayEl?.value||'0',10)||0); if(autoRunState.remaining>0){ autoRunState.remaining -= 1; if(limEl){ limEl.value=String(autoRunState.remaining); } } }catch(_e){} try{ const kitEl=document.getElementById('oneToManyKit'); if(kitEl){ kitEl.value=nextKit||''; } }catch(_e){} try{ const ocnEl2=document.getElementById('ocnInputReports'); if(ocnEl2){ ocnEl2.value=nextOcn||''; await chrome.storage.local.set({ gmOcn: (nextOcn||'').trim() }); } }catch(_e){} try{ await chrome.storage.local.set({ gmReportsFiles: [] }); renderReportsFiles([]); refreshReportStatus(); updateBundleUi(); }catch(_e){} if(autoRunState.remaining>0){ if(autoRunState.delaySec>0){ const countdownEl=document.getElementById('autoRunCountdown'); if(countdownEl) countdownEl.classList.remove('hidden'); let secondsLeft=autoRunState.delaySec; const countdownInterval=setInterval(()=>{ if(countdownEl) countdownEl.textContent=`Starting next run in ${secondsLeft} seconds...`; secondsLeft--; if(secondsLeft<0){ clearInterval(countdownInterval); if(countdownEl) countdownEl.classList.add('hidden'); const runBtn=document.getElementById('btnRunOneToMany'); if(runBtn) runBtn.click(); } },1000); if(countdownEl) countdownEl.textContent=`Starting next run in ${secondsLeft} seconds...`; } else { setTimeout(()=>{ const runBtn=document.getElementById('btnRunOneToMany'); if(runBtn) runBtn.click(); }, 100); } } } }catch(_e){}
+              }
             }
           }catch(_e){}
+          if(skipToNextKit) return; // Stop here if we're skipping to next kit
 
           // On the visualization page, click the Search button to run the segment report
           try{
@@ -2896,17 +2905,120 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
             console.log('[Reports] Segment search clicked, waiting for results...');
           }catch(e){ console.warn('Segment Search click failed', e); }
           await waitForTabComplete(tab.id, 30000);
+          console.log('[Reports] After segment search wait, current tab.id:', tab.id);
+          try{ await navLog(kit,{ area:'reports', step:'post-segment-search-wait', tabId:tab.id }); }catch(_e){}
           // Immediately adopt results tab if background stored it, and close the parent wrong tab
           try{
             const s=await chrome.storage.local.get(['gmSegmentResultsTabId']);
+            console.log('[Reports] Stored gmSegmentResultsTabId:', s.gmSegmentResultsTabId, 'current tab.id:', tab.id);
             if(s.gmSegmentResultsTabId && s.gmSegmentResultsTabId!==tab.id){
               console.log('[Reports] Adopting detected results tab:', s.gmSegmentResultsTabId, 'closing parent:', tab.id);
-              try{ await chrome.tabs.remove(tab.id); }catch(_e){}
+              const oldTabId=tab.id;
               tab.id = s.gmSegmentResultsTabId;
+              try{ await chrome.tabs.remove(oldTabId); }catch(_e){ console.warn('[Reports] Failed to close old tab:', oldTabId); }
+              try{ await navLog(kit,{ area:'reports', step:'adopted-segment-results-tab', old:oldTabId, new:tab.id }); }catch(_e){}
             }
-          }catch(_e){}
+          }catch(e){ console.warn('[Reports] Segment tab adoption error:', e); }
           // Prefer the currently active GEDmatch tab again after the search
-          try{ const activeId2=await getActiveGedmatchTabId(tab.id); if(activeId2!==tab.id){ console.log('[Reports] Using active GEDmatch tab after search:', activeId2); tab.id=activeId2; } }catch(_e){}
+          try{ const activeId2=await getActiveGedmatchTabId(tab.id); console.log('[Reports] Active GEDmatch tab check:', activeId2, 'current:', tab.id); if(activeId2!==tab.id){ console.log('[Reports] Using active GEDmatch tab after search:', activeId2); tab.id=activeId2; try{ await navLog(kit,{ area:'reports', step:'switched-to-active-tab', tabId:activeId2 }); }catch(_e){} } }catch(e){ console.warn('[Reports] Active tab check failed:', e); }
+          
+          // NOW check for opt-out error (this appears after segment search submits, not before)
+          try{
+            await new Promise(r=>setTimeout(r, 2000)); // Let error render
+            const errRes = await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
+              const msg=document.querySelector('[data-drupal-messages] .alert.alert-error');
+              const role=msg?.querySelector('[role="alert"]')||msg;
+              const text=(role && (role.textContent||'').replace(/\s+/g,' ').trim())||'';
+              return { has: !!text, text };
+            }});
+            const errInfo = errRes && errRes[0] && errRes[0].result;
+            if(errInfo && errInfo.has){
+              const msgText=String(errInfo.text||'');
+              console.log('[Reports] Error detected on segment page:', msgText.slice(0,100));
+              try{ await navLog(kit,{ area:'reports', step:'segment-page-error-detected', msg:msgText.slice(0,100) }); }catch(_e){}
+              const isOptOut=/opted out of Law Enforcement/i.test(msgText);
+              if(isOptOut && !retriedOptOut){
+                // Retry: go back to results, uncheck Othram, retry
+                retriedOptOut=true;
+                console.log('[Reports] Opt-out error - attempting retry by unchecking Othram kits');
+                try{ await navLog(kit,{ area:'reports', step:'optout-retry-start' }); }catch(_e){}
+                // Navigate back
+                try{ await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{ history.back(); }}); }catch(_e){}
+                await waitForTabComplete(tab.id, 30000);
+                try{ const activeBack=await getActiveGedmatchTabId(tab.id); if(activeBack!==tab.id){ tab.id=activeBack; } }catch(_e){}
+                // Uncheck cases@othram.com rows
+                try{
+                  const adjustRes = await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
+                    const emailNeedle='cases@othram.com';
+                    let unchecked=0;
+                    try{ const selAll=document.querySelector('input.form-checkbox[title="Select all rows in this table"]'); if(selAll && !selAll.checked){ selAll.click(); selAll.checked=true; selAll.dispatchEvent(new Event('change',{bubbles:true})); } }catch(_e){}
+                    const rows=Array.from(document.querySelectorAll('table tbody tr'));
+                    for(const tr of rows){ const txt=(tr.textContent||'').toLowerCase(); if(txt.includes(emailNeedle)){ const cb=tr.querySelector('input.form-checkbox'); if(cb && cb.checked){ cb.click(); cb.checked=false; cb.dispatchEvent(new Event('change',{bubbles:true})); unchecked++; } } }
+                    try{ if(typeof Drupal!=='undefined' && Drupal.attachBehaviors){ Drupal.attachBehaviors(document, (window.drupalSettings||{})); } }catch(_e){}
+                    return { unchecked };
+                  }});
+                  const uncheckResult=(adjustRes&&adjustRes[0]&&adjustRes[0].result)||{};
+                  console.log('[Reports] Unchecked Othram rows:', uncheckResult.unchecked||0);
+                  try{ await navLog(kit,{ area:'reports', step:'optout-unchecked', count:uncheckResult.unchecked||0 }); }catch(_e){}
+                }catch(_e){}
+                // Re-click Visualization Options
+                try{ await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{ const vis=document.querySelector('#edit-multi-kit-analysis-submit'); if(vis){ vis.click(); } }}); }catch(_e){}
+                try{ await navLog(kit,{ area:'reports', step:'vis-options-retry-click' }); }catch(_e){}
+                await waitForTabComplete(tab.id, 30000);
+                try{ const activeRetry=await getActiveGedmatchTabId(tab.id); if(activeRetry!==tab.id){ tab.id=activeRetry; } }catch(_e){}
+                // Re-click the segment Search button
+                console.log('[Reports] Retry: clicking segment Search again...');
+                try{ await new Promise(res=>chrome.runtime.sendMessage({ type:'gm:watchChildTabs', parentTabId: tab.id }, ()=>res())); }catch(_e){}
+                try{
+                  let clicked=false; let tries=0;
+                  while(!clicked && tries++<5){
+                    const exec = await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{ const b1=document.querySelector('button#edit-submit--2.button.js-form-submit'); const b2=document.querySelector('button#edit-submit.button.js-form-submit'); const b3=document.querySelector('button[data-drupal-selector="edit-submit"].js-form-submit'); const btn=b1||b2||b3; if(btn){ btn.click(); return { clicked:true }; } const i1=document.querySelector('input#edit-submit--2[type="submit"]'); const i2=document.querySelector('input#edit-submit[type="submit"]'); const i3=document.querySelector('input[data-drupal-selector="edit-submit"][type="submit"]'); const alt=i1||i2||i3; if(alt){ alt.click(); return { clicked:true, alt:true }; } return { clicked:false }; }});
+                    clicked = !!(exec && exec[0] && exec[0].result && exec[0].result.clicked);
+                    if(!clicked){ await new Promise(r=>setTimeout(r, 500)); }
+                  }
+                  try{ await navLog(kit,{ area:'reports', step:'segment-search-retry-clicked' }); }catch(_e){}
+                }catch(_e){}
+                await waitForTabComplete(tab.id, 30000);
+                // Adopt tabs again after retry
+                try{ const s2=await chrome.storage.local.get(['gmSegmentResultsTabId']); if(s2.gmSegmentResultsTabId && s2.gmSegmentResultsTabId!==tab.id){ const oldId=tab.id; tab.id=s2.gmSegmentResultsTabId; try{ await chrome.tabs.remove(oldId); }catch(_e){} } }catch(_e){}
+                try{ const activeRetry2=await getActiveGedmatchTabId(tab.id); if(activeRetry2!==tab.id){ tab.id=activeRetry2; } }catch(_e){}
+                // Check for error again after retry
+                await new Promise(r=>setTimeout(r, 2000));
+                try{
+                  const errRes2 = await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{ const msg=document.querySelector('[data-drupal-messages] .alert.alert-error'); const role=msg?.querySelector('[role="alert"]')||msg; const text=(role && (role.textContent||'').replace(/\s+/g,' ').trim())||''; return { has: !!text, text }; }});
+                  const errInfo2 = errRes2 && errRes2[0] && errRes2[0].result;
+                  if(errInfo2 && errInfo2.has){
+                    // Still error after retry - log and skip
+                    console.log('[Reports] Still error after retry, skipping kit');
+                    try{ await navLog(kit,{ area:'reports', step:'optout-retry-still-failed', msg:(errInfo2.text||'').slice(0,100) }); }catch(_e){}
+                    try{ const ocnEl=document.getElementById('ocnInputReports'); let ocn=''; try{ ocn=(ocnEl?.value||'').trim(); }catch(_e){} if(!ocn){ try{ const s=await chrome.storage.local.get(['gmOcn']); ocn=(s?.gmOcn||'').trim(); }catch(_e){} } const stored=await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT'); const base=(stored && stored.ATLAS_LEGACY_ENDPOINT) ? stored.ATLAS_LEGACY_ENDPOINT : 'https://atlas.othram.com:8080/api'; const form=new FormData(); form.append('ocn', ocn); form.append('kit', kit); form.append('site','PRO'); form.append('status','error'); form.append('notes', (errInfo2.text||'').slice(0,200)); await fetch(`${base}/atlas/legacy/save`, { method:'POST', body: form }); }catch(_e){}
+                    skippedErrors += 1; updateSkippedPill();
+                    try{ const stored=await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT'); const base=(stored && stored.ATLAS_LEGACY_ENDPOINT) ? stored.ATLAS_LEGACY_ENDPOINT : 'https://atlas.othram.com:8080/api'; const r=await fetch(`${base}/atlas/legacy/next?site=PRO`, { credentials:'include' }); const j=await r.json().catch(()=>({})); if(r.ok && j?.ok && j?.item){ const { kit: nextKit, ocn: nextOcn }=j.item; try{ const limEl=document.getElementById('autoRunLimit'); const delayEl=document.getElementById('autoRunDelay'); autoRunState.remaining=Math.max(0, parseInt(limEl?.value||'0',10)||0); autoRunState.delaySec=Math.max(0, parseInt(delayEl?.value||'0',10)||0); if(autoRunState.remaining>0){ autoRunState.remaining -= 1; if(limEl){ limEl.value=String(autoRunState.remaining); } } }catch(_e){} try{ const kitEl=document.getElementById('oneToManyKit'); if(kitEl){ kitEl.value=nextKit||''; } }catch(_e){} try{ const ocnEl2=document.getElementById('ocnInputReports'); if(ocnEl2){ ocnEl2.value=nextOcn||''; await chrome.storage.local.set({ gmOcn: (nextOcn||'').trim() }); } }catch(_e){} try{ await chrome.storage.local.set({ gmReportsFiles: [] }); renderReportsFiles([]); refreshReportStatus(); updateBundleUi(); }catch(_e){} if(autoRunState.remaining>0){ if(autoRunState.delaySec>0){ const countdownEl=document.getElementById('autoRunCountdown'); if(countdownEl) countdownEl.classList.remove('hidden'); let secondsLeft=autoRunState.delaySec; const countdownInterval=setInterval(()=>{ if(countdownEl) countdownEl.textContent=`Starting next run in ${secondsLeft} seconds...`; secondsLeft--; if(secondsLeft<0){ clearInterval(countdownInterval); if(countdownEl) countdownEl.classList.add('hidden'); const runBtn=document.getElementById('btnRunOneToMany'); if(runBtn) runBtn.click(); } },1000); if(countdownEl) countdownEl.textContent=`Starting next run in ${secondsLeft} seconds...`; } else { setTimeout(()=>{ const runBtn=document.getElementById('btnRunOneToMany'); if(runBtn) runBtn.click(); }, 100); } } } }catch(_e){}
+                    return;
+                  }
+                  // No error after retry - proceed normally
+                  console.log('[Reports] Retry successful - no error on second attempt');
+                  try{ await navLog(kit,{ area:'reports', step:'optout-retry-success' }); }catch(_e){}
+                }catch(_e){}
+              } else {
+                // Not opt-out error - log and skip
+                console.log('[Reports] Non-opt-out error, skipping kit');
+                try{ await navLog(kit,{ area:'reports', step:'segment-error-skip', msg:msgText.slice(0,100) }); }catch(_e){}
+                try{ const ocnEl=document.getElementById('ocnInputReports'); let ocn=''; try{ ocn=(ocnEl?.value||'').trim(); }catch(_e){} if(!ocn){ try{ const s=await chrome.storage.local.get(['gmOcn']); ocn=(s?.gmOcn||'').trim(); }catch(_e){} } const stored=await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT'); const base=(stored && stored.ATLAS_LEGACY_ENDPOINT) ? stored.ATLAS_LEGACY_ENDPOINT : 'https://atlas.othram.com:8080/api'; const form=new FormData(); form.append('ocn', ocn); form.append('kit', kit); form.append('site','PRO'); form.append('status','error'); form.append('notes', msgText.slice(0,200)); await fetch(`${base}/atlas/legacy/save`, { method:'POST', body: form }); }catch(_e){}
+                skippedErrors += 1; updateSkippedPill();
+                try{ const stored=await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT'); const base=(stored && stored.ATLAS_LEGACY_ENDPOINT) ? stored.ATLAS_LEGACY_ENDPOINT : 'https://atlas.othram.com:8080/api'; const r=await fetch(`${base}/atlas/legacy/next?site=PRO`, { credentials:'include' }); const j=await r.json().catch(()=>({})); if(r.ok && j?.ok && j?.item){ const { kit: nextKit, ocn: nextOcn }=j.item; try{ const limEl=document.getElementById('autoRunLimit'); const delayEl=document.getElementById('autoRunDelay'); autoRunState.remaining=Math.max(0, parseInt(limEl?.value||'0',10)||0); autoRunState.delaySec=Math.max(0, parseInt(delayEl?.value||'0',10)||0); if(autoRunState.remaining>0){ autoRunState.remaining -= 1; if(limEl){ limEl.value=String(autoRunState.remaining); } } }catch(_e){} try{ const kitEl=document.getElementById('oneToManyKit'); if(kitEl){ kitEl.value=nextKit||''; } }catch(_e){} try{ const ocnEl2=document.getElementById('ocnInputReports'); if(ocnEl2){ ocnEl2.value=nextOcn||''; await chrome.storage.local.set({ gmOcn: (nextOcn||'').trim() }); } }catch(_e){} try{ await chrome.storage.local.set({ gmReportsFiles: [] }); renderReportsFiles([]); refreshReportStatus(); updateBundleUi(); }catch(_e){} if(autoRunState.remaining>0){ if(autoRunState.delaySec>0){ const countdownEl=document.getElementById('autoRunCountdown'); if(countdownEl) countdownEl.classList.remove('hidden'); let secondsLeft=autoRunState.delaySec; const countdownInterval=setInterval(()=>{ if(countdownEl) countdownEl.textContent=`Starting next run in ${secondsLeft} seconds...`; secondsLeft--; if(secondsLeft<0){ clearInterval(countdownInterval); if(countdownEl) countdownEl.classList.add('hidden'); const runBtn=document.getElementById('btnRunOneToMany'); if(runBtn) runBtn.click(); } },1000); if(countdownEl) countdownEl.textContent=`Starting next run in ${secondsLeft} seconds...`; } else { setTimeout(()=>{ const runBtn=document.getElementById('btnRunOneToMany'); if(runBtn) runBtn.click(); }, 100); } } } }catch(_e){}
+                return;
+              }
+            }
+          }catch(e){ console.warn('[Reports] Error check failed:', e); }
+          
+          // Verify tab still exists before proceeding
+          console.log('[Reports] Final tab verification before download, tab.id:', tab.id);
+          try{
+            const t=await chrome.tabs.get(tab.id);
+            console.log('[Reports] Tab exists:', !!t, 'url:', t?.url);
+            if(!t){ console.warn('[Reports] Tab no longer exists, attempting to find segment results tab...'); const foundId=await findSegmentResultsTabId(); if(foundId){ tab.id=foundId; console.log('[Reports] Found segment results tab:', foundId); try{ await navLog(kit,{ area:'reports', step:'recovered-tab', tabId:foundId }); }catch(_e){} } else { console.error('[Reports] Could not find segment results tab'); return; } }
+          }catch(e){ console.warn('[Reports] Tab verification failed:', e, 'attempting recovery...'); const foundId=await findSegmentResultsTabId(); if(foundId){ tab.id=foundId; console.log('[Reports] Recovered segment results tab:', foundId); try{ await navLog(kit,{ area:'reports', step:'recovered-tab-after-error', tabId:foundId }); }catch(_e){} } else { console.error('[Reports] Could not recover tab'); return; } }
           // Generate segment CSV link: NEW APPROACH - diagnose then act
           console.log('[Reports] Diagnosing segment page...');
           await new Promise(r=>setTimeout(r, 3000)); // Let AJAX settle
