@@ -71,6 +71,40 @@ A new Reports tab in the side panel orchestrates:
 - Select all rows, click “Visualization Options”, then run the segment search.
 - On the segment results page, click the “Download CSV” button to reveal the link, then (optionally) download the segments CSV.
 
+### LEO opt‑out handling and “additional segments” capture (NEW)
+
+Some kits produce an error immediately upon arriving at the “Visualization Options” page (before the Search button is available):
+
+- Example error (Drupal message on the visualization page):
+  “The following kits have opted out of Law Enforcement and cannot be used when violent offender kits are present: … (Use the back button to edit kits)”
+
+We now handle this flow automatically:
+
+1) Detect the Drupal error on the visualization page and parse the list of opted‑out kit IDs.
+   - We extract everything after the colon and before “(Use the back button to edit kits)”, split on commas/whitespace, and keep only valid kit tokens.
+   - Parsed set is kept as `optedOutKits`.
+
+2) First‑attempt retry (still for the current kit):
+   - Navigate back to the one‑to‑many results page.
+   - Reselect rows: uncheck nothing by default, then uncheck rows belonging to `cases@othram.com` (our Othram rows) for the primary run.
+   - Click “Visualization Options” again. If the error persists on the second check, we log to Atlas and skip the kit.
+
+3) Primary segments CSV capture proceeds normally (segments CSV saved with `kind: 'segments'`).
+
+4) “Additional segments” capture (second pass; NEW):
+   - Triggered only if we previously encountered the opt‑out error and the primary segments CSV was captured successfully.
+   - Navigate directly to the one‑to‑many results page for the same kit (explicit URL), click Search to refresh results.
+   - Selection strategy for the second pass:
+     - Check all `cases@othram.com` rows (Othram internal kits), and
+     - Additionally check up to 10 kit IDs that are NOT present in `optedOutKits`.
+   - Click “Visualization Options” again, run the segment search, and download this second CSV.
+   - Store as `additional-segments.csv` with `kind: 'additional-segments'`.
+   - This file is optional; if any step fails, we log the situation and continue with Auto‑Kinship as normal.
+
+Notes:
+- We never download the one‑to‑many CSV a second time during the additional‑segments pass.
+- The “additional segments” flow is strictly sequential; Auto‑Kinship starts only after this second pass completes (or is skipped on failure).
+
 ### Tab targeting and reliability
 - Results sometimes open in a new tab. We ensure we act on the correct tab using several tactics:
   - Background watchers:
@@ -80,6 +114,10 @@ A new Reports tab in the side panel orchestrates:
   - Fallbacks:
     - `getActiveGedmatchTabId()` reads the last‑focused window’s active tab if it’s on GEDmatch.
     - `findSegmentResultsTabId()` scans tabs by URL and presence of known controls (`#edit-download-csv`).
+
+Enhancements (NEW):
+- After both visualization navigation and segment search, we verify the tab still exists via `chrome.tabs.get(tab.id)` and, if missing, recover the correct tab with `findSegmentResultsTabId()`.
+- When adopting `gmSegmentResultsTabId`, we now log the parent/child switch, close the parent tab, and prefer the active GEDmatch tab again to avoid stale `tab.id`.
 
 ### Drupal form click handling
 - The “Download CSV” button is bound to Drupal AJAX; plain `.click()` is often ignored. We attempt in order:
@@ -104,12 +142,20 @@ A new Reports tab in the side panel orchestrates:
   - Else, parse returned HTML to find `<a href=...csv>`.
 - When a link is resolved, we fetch and store the CSV in `chrome.storage.local` under `gmReportsFiles` with bytes and metadata.
 
+Additional notes (NEW):
+- The same POST/JSON/HTML extraction logic is used for both the primary and the additional segments CSV.
+- We always fetch with `credentials: 'include'` and normalize relative links against the current origin.
+
 ### Progress UI and file management
 - The Reports tab shows a “Downloaded reports” list with each file and actions:
   - Download (save to disk)
   - Delete (trashcan) — removes the entry from storage and updates status
 - A Progress row shows two dots (One‑to‑Many CSV, Segments CSV):
   - Red → pending; Green → file detected in `gmReportsFiles`
+
+Updates (NEW):
+- Each saved file includes a `kind` field (`one`, `segments`, `additional-segments`, `autokinship`).
+- `additional-segments.csv` appears in the downloaded files list when present; it is optional and not required to proceed.
 
 ---
 
@@ -124,6 +170,10 @@ A new Reports tab in the side panel orchestrates:
 6) Use “Get All Trees (auto)” to capture every pedigree detected for the focused kit.
 7) In the Reports tab, run one‑to‑many and segment workflows; when CSVs are captured, the Progress dots turn green and the files appear in the list with Download/Delete.
 8) When done, download outputs (GEDCOM ZIP and/or JSON) and load into ATLAS.
+
+Addendum (error handling & LEO cases):
+- If a visualization‑page error appears (“opted out of Law Enforcement…”), we perform the retry + additional‑segments flow described above.
+- If other visualization errors appear (e.g., “Kit number not found in public DNA database.”), we log error status to Atlas (see below) and skip the kit.
 
 ---
 
@@ -184,6 +234,11 @@ A new Reports tab in the side panel orchestrates:
   - Progress dots that flip green when CSVs are captured
 - Side panel current person/status dots remain for capture flows.
 
+Additional UI/behavior changes (NEW):
+- Reports (beta) defaults: When loading the one‑to‑many page, we set Limit=1000 and cM size=10 programmatically and re‑attach Drupal behaviors so the form recognizes the change.
+- A “Skipped (errors)” counter in the Reports tab increments when a kit is skipped due to errors and is reflected in the panel.
+- Error messages sent to Atlas are truncated to the first 200 characters to keep payloads bounded.
+
 ---
 
 ## Lessons Learned (and why it was hard)
@@ -214,6 +269,13 @@ A new Reports tab in the side panel orchestrates:
   - Each saved file now includes a `kind` to avoid name heuristics.
   - Status dots include a third dot for Auto‑Kinship ZIP.
   - The downloaded files list supports both in‑memory bytes (CSVs) and URL‑backed ZIPs.
+
+Additional changes (NEW):
+- LEO opt‑out handling: parsed opted‑out kit lists, “primary” and “additional” segments passes, sequentialized with Auto‑Kinship.
+- Optional “additional‑segments.csv” saved with `kind: 'additional-segments'`; its absence does not block Auto‑Kinship or bundling.
+- Atlas error uploads: we post `status=error` with a truncated 200‑char message and current `ocn/kit/site`; used for early visualization errors and other failures.
+- Manual vs auto‑run gating: we added `autoRunState.userInitiated` so manual OCN edits or manual clicks do not unintentionally trigger the auto‑runner. The next‑kit auto‑runner still works when enabled and explicitly started.
+- Tab adoption hardening: verify tab existence, recover results tab if the parent was closed, and prefer the active GEDmatch tab.
 
 - Bundle assembly (on demand):
   - When all three artifacts exist, the Bundle section shows “Ready” and enables a Download button.
