@@ -3442,6 +3442,15 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
     return null;
   }
 
+  async function closeSegmentSearchTabs(){
+    try{
+      const tabs=await chrome.tabs.query({ url: 'https://pro.gedmatch.com/tools/multi-kit-analysis/segment-search*' });
+      if(Array.isArray(tabs)){
+        for(const t of tabs){ try{ await chrome.tabs.remove(t.id); }catch(_e){} }
+      }
+    }catch(_e){}
+  }
+
   // Perform a physical click using DevTools Protocol (requires debugger permission)
   async function physicalClickViaDebugger(tabId, selector){
     try{
@@ -3769,6 +3778,8 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
                   try{ const ocnEl=document.getElementById('ocnInputReports'); if(ocnEl){ ocnEl.value=nextOcn||''; await chrome.storage.local.set({ gmOcn: (nextOcn||'').trim() }); } }catch(_e){}
                   // Clear previous files before starting next run
                   try{ await chrome.storage.local.set({ gmReportsFiles: [] }); renderReportsFiles([]); refreshReportStatus(); updateBundleUi(); }catch(_e){}
+                  // Close segment search tab(s) to avoid buildup
+                  try{ await closeSegmentSearchTabs(); }catch(_e){}
                   // schedule next run if remaining>0 with countdown display
                   try{
                     if(!autoRunState.userInitiated && autoRunState.remaining>0 && autoRunState.delaySec>0){
@@ -3802,6 +3813,8 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
                 } else {
                   // No more items
                   try{ const nm=document.getElementById('noMoreKitsMsg'); if(nm) nm.classList.remove('hidden'); }catch(_e){}
+                  // Close segment search tab(s) at end
+                  try{ await closeSegmentSearchTabs(); }catch(_e){}
                 }
               }catch(_e){}
             } else {
