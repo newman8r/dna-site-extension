@@ -2569,6 +2569,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
   const autoRunState={ remaining:0, delaySec:0, running:false, userInitiated:false };
   const btnRun=document.getElementById('btnRunOneToMany');
   const kitInput=document.getElementById('oneToManyKit');
+  const btnSkipKit=document.getElementById('btnSkipKit');
   if(btnRun&&kitInput){
     btnRun.onclick = async () => {
       const kit=(kitInput.value||'').trim(); if(!kit){ alert('Enter a Kit ID first.'); return; }
@@ -3284,6 +3285,74 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
           if(!reportsHalted){ alert('Download link not found.'); }
         }
       } catch(e){ console.error('Fetch CSV failed', e); if(String(e?.message||'')!=='reports-halted'){ alert('Failed to fetch CSV: '+String(e?.message||e)); } }
+    };
+  }
+
+  // Skip current kit: mark error to Atlas, increment skipped counter, clear files, load next
+  if(btnSkipKit){
+    btnSkipKit.onclick = async ()=>{
+      try{
+        const kit=(kitInput?.value||'').trim();
+        if(!kit){ alert('No Kit ID to skip.'); return; }
+        const ocnEl=document.getElementById('ocnInputReports');
+        let ocn=''; try{ ocn=(ocnEl?.value||'').trim(); }catch(_e){}
+        if(!ocn){ try{ const s=await chrome.storage.local.get(['gmOcn']); ocn=(s?.gmOcn||'').trim(); }catch(_e){} }
+        const stored=await chrome.storage.local.get('ATLAS_LEGACY_ENDPOINT');
+        const base=(stored && stored.ATLAS_LEGACY_ENDPOINT) ? stored.ATLAS_LEGACY_ENDPOINT : 'https://atlas.othram.com:8080/api';
+        const form=new FormData();
+        form.append('ocn', ocn);
+        form.append('kit', kit);
+        form.append('site','PRO');
+        form.append('status','error');
+        form.append('notes','manual-skip');
+        const resp=await fetch(`${base}/atlas/legacy/save`, { method:'POST', body: form });
+        const data=await resp.json().catch(()=>({}));
+        if(resp.ok && data?.ok){
+          // increment skipped error counter
+          try{ skippedErrors += 1; updateSkippedPill(); }catch(_e){}
+          // Clear previous files
+          try{ await chrome.storage.local.set({ gmReportsFiles: [] }); renderReportsFiles([]); refreshReportStatus(); updateBundleUi(); }catch(_e){}
+          // Close any segment search tabs
+          try{ await closeSegmentSearchTabs(); }catch(_e){}
+          // Load next kit if available and auto-run if configured
+          try{
+            const r=await fetch(`${base}/atlas/legacy/next?site=PRO`, { credentials:'include' });
+            const j=await r.json().catch(()=>({}));
+            if(r.ok && j?.ok && j?.item){
+              const { kit: nextKit, ocn: nextOcn }=j.item;
+              try{ const kitEl=document.getElementById('oneToManyKit'); if(kitEl){ kitEl.value=nextKit||''; } }catch(_e){}
+              try{ const ocnEl2=document.getElementById('ocnInputReports'); if(ocnEl2){ ocnEl2.value=nextOcn||''; await chrome.storage.local.set({ gmOcn: (nextOcn||'').trim() }); } }catch(_e){}
+              // Auto-run if limit remains
+              try{
+                const limEl=document.getElementById('autoRunLimit');
+                const delayEl=document.getElementById('autoRunDelay');
+                autoRunState.remaining=Math.max(0, parseInt(limEl?.value||'0',10)||0);
+                autoRunState.delaySec=Math.max(0, parseInt(delayEl?.value||'0',10)||0);
+                if(autoRunState.remaining>0){ autoRunState.remaining -= 1; if(limEl){ limEl.value=String(autoRunState.remaining); } }
+                if(autoRunState.remaining>0){
+                  if(autoRunState.delaySec>0){
+                    const countdownEl = document.getElementById('autoRunCountdown');
+                    if(countdownEl) countdownEl.classList.remove('hidden');
+                    let secondsLeft = autoRunState.delaySec;
+                    const timer=setInterval(()=>{
+                      if(countdownEl) countdownEl.textContent = `Starting next run in ${secondsLeft} seconds...`;
+                      secondsLeft--;
+                      if(secondsLeft<0){ clearInterval(timer); if(countdownEl) countdownEl.classList.add('hidden'); const runBtn=document.getElementById('btnRunOneToMany'); if(runBtn) runBtn.click(); }
+                    }, 1000);
+                    if(countdownEl) countdownEl.textContent = `Starting next run in ${secondsLeft} seconds...`;
+                  } else {
+                    setTimeout(()=>{ const runBtn=document.getElementById('btnRunOneToMany'); if(runBtn) runBtn.click(); }, 100);
+                  }
+                }
+              }catch(_e){}
+            } else {
+              try{ const nm=document.getElementById('noMoreKitsMsg'); if(nm) nm.classList.remove('hidden'); }catch(_e){}
+            }
+          }catch(_e){}
+        } else {
+          alert('Failed to skip kit: '+(data?.message||resp.status));
+        }
+      }catch(e){ alert('Skip kit failed: '+String(e?.message||e)); }
     };
   }
 
