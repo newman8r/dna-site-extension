@@ -118,6 +118,7 @@ Notes:
 Enhancements (NEW):
 - After both visualization navigation and segment search, we verify the tab still exists via `chrome.tabs.get(tab.id)` and, if missing, recover the correct tab with `findSegmentResultsTabId()`.
 - When adopting `gmSegmentResultsTabId`, we now log the parent/child switch, close the parent tab, and prefer the active GEDmatch tab again to avoid stale `tab.id`.
+- We proactively close any open segment search tabs (`/tools/multi-kit-analysis/segment-search`) after saving to Atlas or when the run ends, preventing tab buildup during multi‑kit runs.
 
 ### Drupal form click handling
 - The “Download CSV” button is bound to Drupal AJAX; plain `.click()` is often ignored. We attempt in order:
@@ -145,6 +146,19 @@ Enhancements (NEW):
 Additional notes (NEW):
 - The same POST/JSON/HTML extraction logic is used for both the primary and the additional segments CSV.
 - We always fetch with `credentials: 'include'` and normalize relative links against the current origin.
+ 
+### Manual Skip (“Skip kit”) — NEW
+- Location: Reports (beta) controls row, next to “Load Next”.
+- Purpose: When a kit cannot be processed (transient page issue, content anomaly, etc.), the operator can mark it as a manual error and immediately proceed to the next kit.
+- Behavior:
+  - Posts to Atlas with `status=error` and `notes=manual-skip` for the current `{ ocn, kit, site: 'PRO' }`.
+  - Increments the “Skipped (errors)” counter pill.
+  - Clears any downloaded files for the current kit (`gmReportsFiles`) and refreshes the progress dots.
+  - Closes any open segment search tabs to prevent buildup.
+  - Fetches the next kit via `GET /atlas/legacy/next?site=PRO`, populates inputs, and resumes according to auto‑run settings:
+    - If auto‑run is active with remaining count and delay, shows countdown then triggers the next run.
+    - Otherwise, leaves the next kit loaded for manual action.
+  - Works mid‑run; designed to be used while auto grabbing kits from the list.
 
 ### Progress UI and file management
 - The Reports tab shows a “Downloaded reports” list with each file and actions:
@@ -170,6 +184,8 @@ Updates (NEW):
 6) Use “Get All Trees (auto)” to capture every pedigree detected for the focused kit.
 7) In the Reports tab, run one‑to‑many and segment workflows; when CSVs are captured, the Progress dots turn green and the files appear in the list with Download/Delete.
 8) When done, download outputs (GEDCOM ZIP and/or JSON) and load into ATLAS.
+ 
+Tip (NEW): If a kit is problematic, click “Skip kit” to log an error in Atlas for that kit and automatically move to the next one without breaking the run.
 
 Addendum (error handling & LEO cases):
 - If a visualization‑page error appears (“opted out of Law Enforcement…”), we perform the retry + additional‑segments flow described above.
