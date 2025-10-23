@@ -145,6 +145,8 @@ function setCurrentBox(profile, status) {
       tgt.innerHTML = '';
     }
   }
+  // update extended count UI asynchronously
+  updateExtendedCountUI(profile.Kit).catch(()=>{});
   box.classList.remove('hidden');
 }
 
@@ -264,6 +266,214 @@ function samePedigreeTarget(expectedUrl, actualUrl){
   if(!expectedUrl || !actualUrl) return false;
   const a=parsePedigreeParams(expectedUrl); const b=parsePedigreeParams(actualUrl);
   return Boolean(a.id_family) && Boolean(a.id_ged) && a.id_family===b.id_family && a.id_ged===b.id_ged;
+}
+
+// Extended pedigree helpers
+function keyForPedigreeUrl(url){ const p=parsePedigreeParams(url||''); return (p.id_family||'')+"|"+(p.id_ged||''); }
+function labelNorm(s){ return String(s||'').replace(/\u00a0/g,' ').trim().toLowerCase(); }
+function nameNorm(s){ return labelNorm(s).replace(/[^\p{L}\s'-]/gu,' ').replace(/\s+/g,' ').trim(); }
+
+function findExtendedCandidatesFromRows(rowsJson){
+  const out=[]; const seen=new Set();
+  const rows=rowsJson?.rows||[];
+  for(const r of rows){ if(r?.type!=='person') continue; const ctrls=Array.isArray(r.controls)?r.controls:[]; for(const c of ctrls){ if(c?.kind==='expand' && isPedigreeUrl(c.href||'')){ const k=keyForPedigreeUrl(c.href); if(!k) continue; if(seen.has(k)) continue; seen.add(k); out.push({ href:c.href, key:k, rowIdx:r.idx }); } } }
+  return out;
+}
+
+function findExtendedCandidatesFromPre(pre){
+  const out=[]; const seen=new Set();
+  try{
+    const anchors=Array.isArray(pre?.anchors)?pre.anchors:[];
+    for(const a of anchors){ const lbl=String(a?.label||''); const href=resolveGedUrl(a?.href||''); if(!href) continue; if(!isPedigreeUrl(href)) continue; const hasLetters=/\p{L}/u.test(lbl); const looksControl = !hasLetters || /=>|==>|>>|»|→/.test(lbl);
+      if(looksControl){ const k=keyForPedigreeUrl(href); if(!k) continue; if(seen.has(k)) continue; seen.add(k); out.push({ href, key:k }); }
+    }
+  }catch(_e){}
+  return out;
+}
+
+function attachRowIdxToCandidates(candidates, rowsJson){
+  try{
+    if(!Array.isArray(candidates) || !candidates.length) return candidates||[];
+    const rows=rowsJson?.rows||[];
+    const keyToRow=new Map();
+    const keyToHint=new Map();
+    function nearestPersonIdxAround(arrayIdx){
+      // prefer same line person, then search up, then down
+      if(arrayIdx>=0 && arrayIdx<rows.length && rows[arrayIdx].type==='person') return rows[arrayIdx].idx;
+      // search up within small window
+      for(let k=arrayIdx-1;k>=0 && arrayIdx-k<=6;k--){ if(rows[k].type==='person') return rows[k].idx; }
+      // search down within small window
+      for(let k=arrayIdx+1;k<rows.length && k-arrayIdx<=6;k++){ if(rows[k].type==='person') return rows[k].idx; }
+      return null;
+    }
+    for(let i=0;i<rows.length;i++){
+      const r=rows[i];
+      const ctrls=Array.isArray(r.controls)?r.controls:[];
+      for(const c of ctrls){
+        if(c?.kind==='expand' && isPedigreeUrl(c.href||'')){
+          const k=keyForPedigreeUrl(c.href);
+          if(!k || keyToRow.has(k)) continue;
+          const attachIdx = (r.type==='person') ? r.idx : nearestPersonIdxAround(i);
+          if(attachIdx!=null) keyToRow.set(k, attachIdx);
+          // Capture hint name/url from the same row (preferred) or nearest person row
+          let hintName=null, hintUrl=null;
+          if(r.type==='person' && Array.isArray(r.persons) && r.persons.length){
+            const pr=r.persons[0]; hintName=(pr?.name||'')||null; hintUrl=(pr?.url||'')||null;
+          } else {
+            const personRowIdx = (r.type==='person')? i : (function(){
+              const up = (function(){ for(let k=i-1;k>=0 && i-k<=6;k--){ if(rows[k].type==='person') return k; } return null; })();
+              if(up!=null) return up; const dn=(function(){ for(let k=i+1;k<rows.length && k-i<=6;k++){ if(rows[k].type==='person') return k; } return null; })();
+              return dn;
+            })();
+            if(personRowIdx!=null){ const rr=rows[personRowIdx]; if(rr && Array.isArray(rr.persons) && rr.persons.length){ const pr=rr.persons[0]; hintName=(pr?.name||'')||null; hintUrl=(pr?.url||'')||null; } }
+            // If still no hintName, attempt to parse inline person label from the char row text
+            if(!hintName && typeof r.text==='string'){
+              const s=r.text||''; const endCtl=(s.indexOf('==>')>=0?s.indexOf('==>'):s.length); const slice=s.slice(0,endCtl);
+              const m=slice.match(/[\p{L}][^,]{0,120},\s*(?:b\.|d\.)/u);
+              if(m){ const idx=slice.indexOf(m[0]); const label=slice.slice(idx).trim(); try{ const parsed=parsePersonLabel(label); if(parsed?.name) hintName=parsed.name; }catch(_e){} }
+            }
+          }
+          keyToHint.set(k, { name: hintName, url: hintUrl });
+        }
+      }
+    }
+    return candidates.map(c=>{
+      let out=c;
+      if(c.rowIdx==null && keyToRow.has(c.key)) out={ ...out, rowIdx: keyToRow.get(c.key) };
+      const h=keyToHint.get(c.key); if(h){ out={ ...out, hintName: h.name||out.hintName, hintUrl: h.url||out.hintUrl }; }
+      return out;
+    });
+  }catch(_e){ return candidates||[]; }
+}
+
+function buildRowToIdMap(rowsJson){
+  const rows=rowsJson?.rows||[]; const rowToId=new Map(); let id=0;
+  for(const r of rows){ if(r.type==='person' && Array.isArray(r.persons) && r.persons.length){ rowToId.set(r.idx, id++); } }
+  return rowToId;
+}
+
+function getRootPersonIndex(people){ if(!Array.isArray(people)||!people.length) return 0; let best=0; let bestIndent=Number(people[0].indent||0); for(let i=1;i<people.length;i++){ const d=Number(people[i].indent||0); if(d<bestIndent){ best=i; bestIndent=d; } } return best; }
+
+function findLikelyOverlapBaseId(baseGraph, extGraph, hintedBaseId, candidate){
+  // If we have a hinted overlap id (from row mapping), prefer it
+  if(hintedBaseId!=null) return hintedBaseId;
+  // Else, try URL/label match between extended root and any base person
+  const rootId=getRootPersonIndex(extGraph.people);
+  const root=extGraph.people[rootId]||{};
+  const u=(root.url||'').trim(); const ln=labelNorm(root.label||root.name||root.originalName||'');
+  // First try explicit candidate hint
+  if(candidate){
+    const hintU=(candidate.hintUrl||'').trim(); const hintN=labelNorm(candidate.hintName||'');
+    for(let i=0;i<baseGraph.people.length;i++){
+      const bp=baseGraph.people[i]; const bu=(bp.url||'').trim(); const bn=labelNorm(bp.label||bp.name||bp.originalName||'');
+      if(hintU && bu===hintU) return i;
+      if(hintN && bn && bn===hintN) return i;
+    }
+  }
+  for(let i=0;i<baseGraph.people.length;i++){
+    const bp=baseGraph.people[i];
+    if(u && (bp.url||'').trim()===u) return i;
+    const bln=labelNorm(bp.label||bp.name||bp.originalName||'');
+    if(ln && bln && ln===bln) return i;
+  }
+  return null;
+}
+
+function buildBaseIndexes(people){
+  const byUrl=new Map(); const byLabel=new Map();
+  for(let i=0;i<people.length;i++){
+    const p=people[i]; const u=(p.url||'').trim(); const ln=labelNorm(p.label||p.name||p.originalName||'');
+    if(u){ if(!byUrl.has(u)) byUrl.set(u,i); }
+    if(ln){ if(!byLabel.has(ln)) byLabel.set(ln, i); }
+  }
+  return { byUrl, byLabel };
+}
+
+function findExtOverlapId(extGraph, candidate){
+  const people=extGraph.people||[];
+  const hintU=(candidate?.hintUrl||'').trim(); const hintN=nameNorm(candidate?.hintName||'');
+  if(hintU){ const i=people.findIndex(p=> (p.url||'').trim()===hintU ); if(i>=0) return i; }
+  if(hintN){
+    let i=people.findIndex(p=> nameNorm(p.name||p.label||p.originalName||'')===hintN );
+    if(i>=0) return i;
+    i=people.findIndex(p=> labelNorm(p.label||'').includes(hintN));
+    if(i>=0) return i;
+  }
+  // fallback to root if nothing else
+  return getRootPersonIndex(people);
+}
+
+function findBaseIdByCandidateKey(baseGraph, candidate){
+  try{
+    if(!candidate?.key) return null; const [idf, idg]=String(candidate.key).split('|');
+    if(!idf || !idg) return null; const ppl=baseGraph?.people||[];
+    for(let i=0;i<ppl.length;i++){
+      const u=(ppl[i].url||'').trim(); if(!u) continue; const p=parsePedigreeParams(u); if(p.id_family===idf && p.id_ged===idg) return i;
+    }
+    return null;
+  }catch(_e){ return null; }
+}
+
+function mergeExtendedIntoBase(baseGraph, extGraph, overlapBaseId){
+  if(overlapBaseId==null || overlapBaseId===undefined){
+    return { graph: { people: baseGraph.people.slice(), families: baseGraph.families.slice().map(f=>({ parents:(f.parents||[]).slice(0,2), children:(f.children||[]).slice() })) }, skipped: 'no-overlap' };
+  }
+  const basePeople=baseGraph.people.slice();
+  const baseFamilies=baseGraph.families.slice().map(f=>({ parents:(f.parents||[]).slice(0,2), children:(f.children||[]).slice() }));
+  const { byUrl, byLabel } = buildBaseIndexes(basePeople);
+  const extToBase=new Map();
+
+  // Map extended root to known overlap person
+  const extRootId= (typeof extGraph.extRootOverride==='number' && extGraph.extRootOverride>=0) ? extGraph.extRootOverride : getRootPersonIndex(extGraph.people);
+  const extRoot=extGraph.people[extRootId]||{};
+  if(String(extRoot?.name||'').trim().toLowerCase()==='hidden'){
+    return { graph: { people: basePeople, families: baseFamilies }, skipped: 'hidden-root' };
+  }
+  extToBase.set(extRootId, overlapBaseId);
+
+  // Helper to create or find base person for an extended person
+  function ensureBasePerson(extId){
+    if(extToBase.has(extId)) return extToBase.get(extId);
+    const ep=extGraph.people[extId]; if(!ep){ return null; }
+    const u=(ep.url||'').trim(); const ln=labelNorm(ep.label||ep.name||ep.originalName||'');
+    let bid=null;
+    if(u && byUrl.has(u)) bid=byUrl.get(u);
+    else if(ln && byLabel.has(ln)) bid=byLabel.get(ln);
+    if(bid==null){
+      bid=basePeople.length;
+      basePeople.push({ id: bid, name: (ep.name||'Unknown'), originalName: ep.originalName||ep.name||'', sex: (ep.sex||'U'), birth: ep.birth||null, death: ep.death||null, url: ep.url||'', indent: ep.indent??0, col: ep.col??0, label: (ep.label||'').trim(), line: ep.line??-1, parents: [], children: [], spouse: null });
+      if(u){ byUrl.set(u,bid); }
+      if(ln){ byLabel.set(ln,bid); }
+    }
+    extToBase.set(extId,bid);
+    return bid;
+  }
+
+  // Map all persons referenced by families to base ids
+  for(const fam of (extGraph.families||[])){
+    const pids=(fam.parents||[]).slice(0,2).map(ensureBasePerson).filter(x=>x!=null);
+    const cids=(fam.children||[]).map(ensureBasePerson).filter(x=>x!=null);
+    if(!pids.length && !cids.length) continue;
+    // Find or create base family by parent set
+    const key=pids.slice().sort((a,b)=>a-b).join('|');
+    let baseFam=baseFamilies.find(f=>f.parents.slice().sort((a,b)=>a-b).join('|')===key);
+    if(!baseFam){ baseFam={ parents: pids.slice(0,2), children: [] }; baseFamilies.push(baseFam); }
+    for(const c of cids){ if(!baseFam.children.includes(c)) baseFam.children.push(c); }
+  }
+
+  return { graph: { people: basePeople, families: baseFamilies }, skipped: null };
+}
+
+async function updateExtendedCountUI(kit){
+  try{
+    const btn=document.getElementById('btnCaptureExtended'); if(!btn) return;
+    const store=await chrome.storage.local.get(['gmCapturedByKit']);
+    const cap=(store.gmCapturedByKit||{})[kit];
+    const candidates=Array.isArray(cap?.extendedCandidates)?cap.extendedCandidates:[];
+    const visited=new Set(Array.isArray(cap?.extendedVisited)?cap.extendedVisited:[]);
+    const remaining=candidates.filter(c=>!visited.has(c.key)).length;
+    btn.textContent=`Capture Extended Pages (${remaining})`;
+  }catch(_e){}
 }
 
 function clusterRows(anchors){ const sorted=[...anchors].sort((a,b)=>a.y-b.y); const rows=[]; const ys=[]; for(const a of sorted){ if(!ys.length || Math.abs(a.y-ys[ys.length-1])>14){ ys.push(a.y); rows.push([a]); } else { rows[rows.length-1].push(a); } } return rows; }
@@ -535,32 +745,52 @@ function buildIntermediaryRows(result){
     if(!s || s.trim().length===0) continue;
     // pipe scan for every row (both person and char rows can have pipes)
     const rowPipes=[]; for(let c=0;c<s.length;c++){ if(s[c]==='|') rowPipes.push(c); }
-    // detect persons from anchors on this line
+    // detect persons and controls from anchors on this line (process all matches)
     const persons=[]; const controls=[]; {
       const matchIdxs=[];
       for(let ai=0; ai<anchors.length; ai++){
         const a=anchors[ai]; const lbl=(a.labelNorm||a.label||''); if(!lbl) continue; if(s.indexOf(lbl)!==-1) matchIdxs.push(ai);
       }
-      // pick the first unused matching anchor (there should be exactly one person per line)
-      const chosenIdx=matchIdxs.find(ai=>!usedAnchor[ai]);
-      if(chosenIdx!=null){
-        const a=anchors[chosenIdx]; usedAnchor[chosenIdx]=true;
+      // sort by first occurrence in the line to stabilize processing order
+      matchIdxs.sort((aIdx,bIdx)=>{
+        const la=(anchors[aIdx].labelNorm||anchors[aIdx].label||'');
+        const lb=(anchors[bIdx].labelNorm||anchors[bIdx].label||'');
+        return (s.indexOf(la)) - (s.indexOf(lb));
+      });
+      for(const ai of matchIdxs){
+        if(usedAnchor[ai]) continue;
+        const a=anchors[ai];
         const lbl=(a.labelNorm||a.label||'');
         let idx=s.indexOf(lbl);
-        // detect navigation/expand anchors (e.g., '=>', '>>', arrows) — labels with no letters (Unicode-aware)
         const hasLetters=/\p{L}/u.test(lbl);
         const isControl = !hasLetters;
         if(isControl){
           controls.push({ kind:'expand', col: idx, label: a.label, href: resolveGedUrl(a.href||'') });
-        } else {
-          const parsed=parsePersonLabel(lbl);
-          if(idx===-1){ const nameOnly=(parsed?.name||'').trim(); if(nameOnly){ idx=s.indexOf(nameOnly); } }
-          const sex=a.color==='red'?'F':a.color==='blue'?'M':'U';
-          const url=resolveGedUrl(a.href||'');
-          const indentRaw=idx; const px=a.x;
-          const rec={ label:lbl, name:parsed.name, birth:parsed.birth, death:parsed.death, sex, url, col:idx, indentRaw, px, indent:null, leadingSpaces:(s.match(/^\s*/)||[''])[0].length };
-          persons.push(rec); personRefs.push({ line:i, ref:rec });
+          usedAnchor[ai]=true;
+          continue;
         }
+        const parsed=parsePersonLabel(lbl);
+        if(idx===-1){ const nameOnly=(parsed?.name||'').trim(); if(nameOnly){ idx=s.indexOf(nameOnly); } }
+        const sex=a.color==='red'?'F':a.color==='blue'?'M':'U';
+        const url=resolveGedUrl(a.href||'');
+        const indentRaw=idx; const px=a.x;
+        const rec={ label:lbl, name:parsed.name, birth:parsed.birth, death:parsed.death, sex, url, col:idx, indentRaw, px, indent:null, leadingSpaces:(s.match(/^\s*/)||[''])[0].length };
+        persons.push(rec); personRefs.push({ line:i, ref:rec });
+        usedAnchor[ai]=true;
+      }
+    }
+    // Fallback: capture plaintext person on char row with trailing expand control (e.g., spouse on same line)
+    if(!persons.length){
+      const endCtl=(s.indexOf('==>')>=0?s.indexOf('==>'):s.length);
+      const slice=s.slice(0, endCtl);
+      const m=slice.match(/([\p{L}][^,]{0,120}),\s*(?:b\.|d\.)/u);
+      if(m && typeof m.index==='number'){
+        const idx=m.index; const label=slice.slice(idx).trim(); const parsed=parsePersonLabel(label);
+        // try infer sex by proximity to a colored anchor on the same line
+        let sex='U';
+        for(const a of anchors){ const ll=(a.labelNorm||a.label||''); const pos=s.indexOf(ll); if(pos!==-1 && Math.abs(pos-idx)<40){ if((a.color||'').toLowerCase()==='red') sex='F'; else if((a.color||'').toLowerCase()==='blue') sex='M'; break; } }
+        const rec={ label, name: parsed.name, birth: parsed.birth, death: parsed.death, sex, url:'', col: idx, indentRaw: idx, px: null, indent: null, leadingSpaces:(s.match(/^\s*/)||[''])[0].length };
+        persons.push(rec); personRefs.push({ line:i, ref:rec });
       }
     }
     if(persons.length){
@@ -1747,13 +1977,63 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
 
   document.getElementById('clearSession').onclick = async () => { if(!confirm('This will permanently clear the loaded CSV, parsed list, statuses, and pending data. Continue?')) return; await chrome.storage.local.remove(['gmGedmatchSession','gmGedmatchPendingMeta','gmPendingCsvText','gmStatusByKit','gmFocusedKit','gmCapturedByKit','gmLogsByKit']); document.getElementById('rows').innerHTML=''; document.getElementById('currentBox').classList.add('hidden'); updateStats([],'Cleared'); };
 
-  document.getElementById('btnCapture').onclick = async () => { const st=await getState(); const kit=st.focusedKit; if(!kit){ alert('No focused individual. Click Open on a row first.'); return;} try { const pre=await extractPreFromActiveTab(); if(!isPedigreeUrl(pre?.frame||'')){ alert('Not on a GEDmatch pedigree page. Navigate to a /tools/gedcom/pedigree-chart page first.'); return; } const rowsJson=buildIntermediaryRows(pre); const built=buildFamiliesFromRowsV9(rowsJson); const profile=st.session.profiles.find(x=>x.Kit===kit); const gedcom=await buildGedcom(built.people,{ kit, rootName: profile?.Name||'', atdnaTotal: profile?.AtdnaTotal||'' }, built.families); await saveCapture(kit,{ rowsJson, gedcom, count: built.people.length, families: built.families.length, capturedAt:new Date().toISOString(), sourceUrl: pre?.frame||profile?.treeUrl||'' }, built.logs); const statusByKit=st.statusByKit; statusByKit[kit]='yellow'; await saveStatusMap(statusByKit); setCurrentBox(profile,'yellow'); refreshStatusDots(st.session.profiles,statusByKit); updateStats(st.session.profiles, `Captured ${built.people.length} people, ${built.families.length} families`);} catch(e){ console.error('Capture failed',e); alert('Capture failed: '+(e?.message||e)); } };
+  document.getElementById('btnCapture').onclick = async () => { const st=await getState(); const kit=st.focusedKit; if(!kit){ alert('No focused individual. Click Open on a row first.'); return;} try { const pre=await extractPreFromActiveTab(); if(!isPedigreeUrl(pre?.frame||'')){ alert('Not on a GEDmatch pedigree page. Navigate to a /tools/gedcom/pedigree-chart page first.'); return; } const rowsJson=buildIntermediaryRows(pre); const built=buildFamiliesFromRowsV9(rowsJson); const profile=st.session.profiles.find(x=>x.Kit===kit); const gedcom=await buildGedcom(built.people,{ kit, rootName: profile?.Name||'', atdnaTotal: profile?.AtdnaTotal||'' }, built.families); // detect extended candidates and persist alongside capture
+      // Prefer scanning original anchors first, then fallback to rowsJson controls
+      let extendedCandidates=findExtendedCandidatesFromPre(pre); if(!extendedCandidates.length){ extendedCandidates=findExtendedCandidatesFromRows(rowsJson); } extendedCandidates=attachRowIdxToCandidates(extendedCandidates, rowsJson); const store=await chrome.storage.local.get(['gmCapturedByKit']); const cur=(store.gmCapturedByKit||{})[kit]||{}; const prevVisited=new Set(Array.isArray(cur.extendedVisited)?cur.extendedVisited:[]); // de-dupe by key
+      const dedup=[]; const seen=new Set(); for(const c of extendedCandidates){ if(!seen.has(c.key)){ seen.add(c.key); dedup.push(c); } }
+      extendedCandidates=dedup;
+      await saveCapture(kit,{ rowsJson, gedcom, count: built.people.length, families: built.families.length, capturedAt:new Date().toISOString(), sourceUrl: pre?.frame||profile?.treeUrl||'', extendedCandidates, extendedVisited: Array.from(prevVisited) }, built.logs);
+      const statusByKit=st.statusByKit; statusByKit[kit]='yellow'; await saveStatusMap(statusByKit); setCurrentBox(profile,'yellow'); refreshStatusDots(st.session.profiles,statusByKit); await updateExtendedCountUI(kit); updateStats(st.session.profiles, `Captured ${built.people.length} people, ${built.families.length} families`);} catch(e){ console.error('Capture failed',e); alert('Capture failed: '+(e?.message||e)); } };
 
   document.getElementById('btnFinalize').onclick = async () => { const st=await getState(); const kit=st.focusedKit; if(!kit) return; const statusByKit=st.statusByKit; statusByKit[kit]='green'; await saveStatusMap(statusByKit); const profile=st.session.profiles.find(x=>x.Kit===kit); setCurrentBox(profile,'green'); refreshStatusDots(st.session.profiles,statusByKit); };
 
   document.getElementById('btnClearCopy').onclick = async () => { const st=await getState(); const kit=st.focusedKit; if(!kit) return; const store=await chrome.storage.local.get(['gmCapturedByKit']); const cap=store.gmCapturedByKit||{}; delete cap[kit]; await chrome.storage.local.set({ gmCapturedByKit: cap }); const statusByKit=st.statusByKit; statusByKit[kit]='red'; await saveStatusMap(statusByKit); const profile=st.session.profiles.find(x=>x.Kit===kit); setCurrentBox(profile,'red'); refreshStatusDots(st.session.profiles,statusByKit); };
 
-  document.getElementById('btnCaptureSub').onclick = () => { alert('Capture Subtree: coming soon'); };
+  document.getElementById('btnCaptureExtended').onclick = async () => {
+    const st=await getState(); const kit=st.focusedKit; if(!kit){ alert('No focused individual.'); return; }
+    const store=await chrome.storage.local.get(['gmCapturedByKit']); const capAll=store.gmCapturedByKit||{}; const cap=capAll[kit]; if(!cap?.rowsJson || !cap?.gedcom){ alert('Capture the main tree first.'); return; }
+    const candidates=Array.isArray(cap.extendedCandidates)?cap.extendedCandidates:[]; let visited=new Set(Array.isArray(cap.extendedVisited)?cap.extendedVisited:[]);
+    if(!candidates.length){ alert('No extended pages detected.'); return; }
+    // Build base graph from last build to merge into
+    const baseBuilt=buildFamiliesFromRowsV9(cap.rowsJson);
+    let baseGraph={ people: baseBuilt.people, families: baseBuilt.families };
+    // Build row->person map on base
+    const rowToId=buildRowToIdMap(cap.rowsJson);
+    let mergedCount=0; let skippedHidden=0;
+    for(const cand of candidates){ if(visited.has(cand.key)) continue; try{
+        // Enforce rule: one extension per individual; skip if this base person already had an extension
+        const alreadyUsed=new Set(Array.isArray(cap.extendedAttachedTo)?cap.extendedAttachedTo:[]);
+        const tab=await chrome.tabs.create({ url:cand.href, active:false });
+        await waitForTabComplete(tab.id, 20000);
+        const pre=await extractPreFromTabId(tab.id);
+        if(!isPedigreeUrl(pre?.frame||'') || !samePedigreeTarget(cand.href, pre.frame)){ await chrome.tabs.remove(tab.id); visited.add(cand.key); continue; }
+        const rows2=buildIntermediaryRows(pre);
+        const built2=buildFamiliesFromRowsV9(rows2);
+        // choose the extended overlap person directly using candidate hint (inside the extended page)
+        const extOverlapId = findExtOverlapId({ people: built2.people, families: built2.families }, cand);
+        // choose overlap base id by row mapping or hint/base matching
+        // try direct URL param match between candidate key and base people first (strongest)
+        const keyMatchedBaseId = findBaseIdByCandidateKey({ people: baseGraph.people, families: baseGraph.families }, cand);
+        const hintedId = keyMatchedBaseId!=null ? keyMatchedBaseId : ((cand.rowIdx!=null && rowToId.has(cand.rowIdx)) ? rowToId.get(cand.rowIdx) : null);
+        const overlapBaseId = findLikelyOverlapBaseId({ people: baseGraph.people, families: baseGraph.families }, { people: built2.people, families: built2.families }, hintedId, cand);
+        if(overlapBaseId!=null && alreadyUsed.has(overlapBaseId)){ visited.add(cand.key); await chrome.tabs.remove(tab.id); continue; }
+        const res=mergeExtendedIntoBase(baseGraph, { people: built2.people, families: built2.families, extRootOverride: extOverlapId }, overlapBaseId);
+        if(res.skipped==='hidden-root'){ skippedHidden++; visited.add(cand.key); await chrome.tabs.remove(tab.id); continue; }
+        if(res.skipped==='no-overlap'){ visited.add(cand.key); await chrome.tabs.remove(tab.id); continue; }
+        baseGraph=res.graph; mergedCount++; visited.add(cand.key);
+        // track which base ids have an extension attached
+        const updatedCapAll=await chrome.storage.local.get(['gmCapturedByKit']); const allCaps=updatedCapAll.gmCapturedByKit||{}; const thisCap=allCaps[kit]||cap; const att=new Set(Array.isArray(thisCap.extendedAttachedTo)?thisCap.extendedAttachedTo:[]); if(overlapBaseId!=null) att.add(overlapBaseId); thisCap.extendedAttachedTo=Array.from(att); allCaps[kit]=thisCap; await chrome.storage.local.set({ gmCapturedByKit: allCaps });
+        await chrome.tabs.remove(tab.id);
+      } catch(e){ try{ if(e?.tab?.id) await chrome.tabs.remove(e.tab.id); }catch(_e){} visited.add(cand.key); }
+    }
+    // Rebuild GEDCOM from merged graph
+    const profile=st.session.profiles.find(x=>x.Kit===kit);
+    const newGed=await buildGedcom(baseGraph.people,{ kit, rootName: profile?.Name||'', atdnaTotal: profile?.AtdnaTotal||'' }, baseGraph.families);
+    capAll[kit]={ ...cap, rowsJson: cap.rowsJson, gedcom: newGed, count: baseGraph.people.length, families: baseGraph.families.length, extendedCandidates: candidates, extendedVisited: Array.from(visited) };
+    await chrome.storage.local.set({ gmCapturedByKit: capAll });
+    await updateExtendedCountUI(kit);
+    alert(`Extended pages processed: merged ${mergedCount}${skippedHidden?`, skipped hidden-root: ${skippedHidden}`:''}`);
+  };
 
   // Auto-capture all detected tree links for the focused kit
   document.getElementById('btnGetAllTrees').onclick = async () => {

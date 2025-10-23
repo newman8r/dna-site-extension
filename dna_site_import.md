@@ -207,6 +207,35 @@ Addendum (error handling & LEO cases):
 
 ---
 
+## Extended Pedigree Pages (NEW)
+
+Some large GEDmatch pedigrees paginate/extend via compact control anchors (e.g., a blue "==>") that open additional pedigree pages for the same `id_family`/`id_ged` context. These extended pages always overlap one individual from the main page and must be merged into the captured tree.
+
+UI and workflow:
+- Capture Tree now also detects extended-page links during extraction and shows a count on a new button: "Capture Extended Pages (N)".
+- Clicking "Capture Extended Pages" opens each extended page in the background, extracts the ASCII pedigree, merges it into the base capture, and closes the tab.
+
+Detection:
+- During `buildIntermediaryRows`, control anchors (labels without letters, like "==>") are recorded with `kind: 'expand'` and normalized `href`.
+- Extended candidates are identified as controls with `href` passing `isPedigreeUrl` and deduplicated by `(id_family|id_ged)`.
+
+Merging strategy:
+- The extended page is parsed with the same V9 pipeline.
+- Overlap anchor: we map the extended root to the base person associated with the control’s source row; if unavailable, we fallback to the base root.
+- Persons are merged by URL first, then normalized label (case-insensitive, NBSP-normalized). New persons are appended; families are merged by parent set.
+
+Hidden-root caveat:
+- If the extended page’s root person name is exactly "Hidden" (case-insensitive), we skip merging that extended page to avoid ambiguous placement when multiple "Hidden" entries exist.
+
+Persistence and idempotency:
+- Per kit, we store `extendedCandidates[]` and `extendedVisited[]`. The count on the button reflects remaining candidates.
+- Failures are logged; visited entries are marked to avoid repeated attempts.
+
+Integration with automation:
+- Extended-page capture is available as a dedicated action and can be composed after main capture within per‑kit automation flows.
+
+---
+
 ## Name Normalization & Matching
 
 - `nameNorm = toLower(unaccent(stripSurnameSlashes(trimWhitespace(name))))`.
