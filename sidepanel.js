@@ -3014,26 +3014,41 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
           return; // hard stop
         }
       }catch(_e){}
-      // Click Download CSV button to generate the link
+      // Click Download CSV button to generate the link (handle new UI and auto-download behavior)
       try{ ensureNotHalted();
         await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
-          const dl=document.querySelector('button#edit-download-csv.js-form-submit');
-          if(dl){ dl.click(); return { clicked:true }; }
-          const alt=document.querySelector('input#edit-download-csv[type="submit"]');
-          if(alt){ alt.click(); return { clicked:true, alt:true }; }
+          // If the new UI already injected the CSV link, skip clicking
+          const existingLink=[...document.querySelectorAll('a[href]')].find(a=>/\.csv(\?|$)/i.test(a.getAttribute('href')||a.href||''));
+          if(existingLink){ return { clicked:false, linkAlready:true }; }
+          // Try legacy/button selectors first
+          const btn=document.querySelector('button#edit-download-csv.js-form-submit, input#edit-download-csv[type="submit"], [data-drupal-selector="edit-download-csv"]');
+          if(btn){ btn.click(); return { clicked:true, kind:'legacy' }; }
+          // Fallback: any visible element whose text/value suggests "Download CSV"
+          const cands=[...document.querySelectorAll('button, input[type="submit"], a[role="button"], a.btn, a.button')];
+          const isVisible=(el)=>{ const cs=getComputedStyle(el); const r=el.getBoundingClientRect(); return cs.display!=='none' && cs.visibility!=='hidden' && r.width>0 && r.height>0; };
+          const byText=cands.find(el=>{ const t=(el.textContent||el.value||'').toLowerCase(); return isVisible(el) && /download\s*csv/i.test(t); });
+          if(byText){ byText.click(); return { clicked:true, kind:'byText' }; }
           return { clicked:false };
         }});
         try{ await navLog(kit,{ area:'reports', step:'one-to-many-download-clicked' }); }catch(_e){}
         renderReportsLog();
       } catch(e){ if(String(e?.message||'')!=='reports-halted'){ console.warn('Download button click failed', e); } }
       await waitForTabComplete(tab.id, 30000);
-      // Find the generated link by text and fetch the CSV
+      // Find the generated link (new text and structure) and fetch the CSV
       try{ ensureNotHalted();
         const execRes = await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
           if(location.host.includes('auth.gedmatch.com') && location.pathname.includes('/u/login/identifier')){
             return { ok:false, login:true };
           }
-          const a=[...document.querySelectorAll('a')].find(x=> (x.textContent||'').trim()==='Click here to download file.');
+          // Prefer anchors with .csv href
+          let a=[...document.querySelectorAll('a[href]')].find(x=>/\.csv(\?|$)/i.test(x.getAttribute('href')||x.href||''));
+          // Fallbacks: match by text phrases (new UI string)
+          if(!a){
+            a=[...document.querySelectorAll('a')].find(x=>{
+              const t=(x.textContent||'').toLowerCase();
+              return t.includes('csv file ready') || (t.includes('click here') && t.includes('download'));
+            });
+          }
           if(!a) return { ok:false };
           const href=a.getAttribute('href')||a.href||'';
           const url = href && /^https?:/i.test(href) ? href : (href ? (new URL(href, location.origin)).toString() : '');
@@ -3064,21 +3079,25 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
           renderReportsLog();
           // Proceed to segment match flow: select all and open Visualization Options
           try{
-            await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
-              const selAll=document.querySelector('input.form-checkbox[title="Select all rows in this table"]');
+            const resSel = await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
+              const selAll=document.querySelector('input[type="checkbox"][title="Select all rows in this table"], thead input[type="checkbox"]');
               if(selAll){
                 if(!selAll.checked){ selAll.click(); selAll.checked=true; }
                 selAll.dispatchEvent(new Event('change', { bubbles:true }));
-                return { selected:true };
+                return { selected:true, mode:'master' };
               }
-              return { selected:false };
+              // Manual: click each row checkbox
+              let count=0;
+              const boxes=[...document.querySelectorAll('table tbody input[type="checkbox"][id^="edit-multi-kit-analysis-kits-"], table tbody input[type="checkbox"][name^="multi_kit_analysis["]')];
+              for(const cb of boxes){ if(!cb.disabled && !cb.checked){ cb.click(); cb.checked=true; cb.dispatchEvent(new Event('change',{bubbles:true})); count++; } }
+              return { selected: count>0, mode:'manual', count };
             }});
-            try{ await navLog(kit,{ area:'reports', step:'select-all', selected:true }); }catch(_e){}
+            try{ const r=(resSel&&resSel[0]&&resSel[0].result)||{}; await navLog(kit,{ area:'reports', step:'select-all', selected:!!r.selected, mode:r.mode||'unknown', count:r.count||0 }); }catch(_e){}
             renderReportsLog();
-          }catch(e){ console.warn('Select-all failed', e); }
+          }catch(e){ console.warn('Select-all/manual selection failed', e); }
           try{
             await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
-              const vis=document.querySelector('#edit-multi-kit-analysis-submit');
+              const vis=document.querySelector('#edit-multi-kit-analysis-submit, [data-drupal-selector="edit-multi-kit-analysis-submit"], input.btn-visualization#edit-multi-kit-analysis-submit, input[type="submit"][value="Visualization"]');
               if(vis){ vis.click(); return { clicked:true }; }
               return { clicked:false };
             }});
@@ -3130,9 +3149,9 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
                   const adjustRes = await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
                     const emailNeedle='cases@othram.com';
                     let unchecked=0;
-                    try{ const selAll=document.querySelector('input.form-checkbox[title="Select all rows in this table"]'); if(selAll && !selAll.checked){ selAll.click(); selAll.checked=true; selAll.dispatchEvent(new Event('change',{bubbles:true})); } }catch(_e){}
+                    try{ const selAll=document.querySelector('input[type="checkbox"][title="Select all rows in this table"], thead input[type="checkbox"]'); if(selAll && !selAll.checked){ selAll.click(); selAll.checked=true; selAll.dispatchEvent(new Event('change',{bubbles:true})); } }catch(_e){}
                     const rows=Array.from(document.querySelectorAll('table tbody tr'));
-                    for(const tr of rows){ const txt=(tr.textContent||'').toLowerCase(); if(txt.includes(emailNeedle)){ const cb=tr.querySelector('input.form-checkbox'); if(cb && cb.checked){ cb.click(); cb.checked=false; cb.dispatchEvent(new Event('change',{bubbles:true})); unchecked++; } } }
+                    for(const tr of rows){ const txt=(tr.textContent||'').toLowerCase(); if(txt.includes(emailNeedle)){ const cb=tr.querySelector('input[type="checkbox"]'); if(cb && cb.checked){ cb.click(); cb.checked=false; cb.dispatchEvent(new Event('change',{bubbles:true})); unchecked++; } } }
                     try{ if(typeof Drupal!=='undefined' && Drupal.attachBehaviors){ Drupal.attachBehaviors(document, (window.drupalSettings||{})); } }catch(_e){}
                     return { unchecked };
                   }});
@@ -3141,7 +3160,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
                   try{ await navLog(kit,{ area:'reports', step:'optout-rows-unchecked', count:uncheckResult.unchecked||0 }); }catch(_e){}
                 }catch(_e){}
                 // Re-click Visualization Options - this will reload the vis page
-                try{ await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{ const vis=document.querySelector('#edit-multi-kit-analysis-submit'); if(vis){ vis.click(); } }}); }catch(_e){}
+                try{ await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{ const vis=document.querySelector('#edit-multi-kit-analysis-submit, [data-drupal-selector="edit-multi-kit-analysis-submit"], input.btn-visualization#edit-multi-kit-analysis-submit, input[type="submit"][value="Visualization"]'); if(vis){ vis.click(); } }}); }catch(_e){}
                 try{ await navLog(kit,{ area:'reports', step:'vis-options-retry-clicked' }); }catch(_e){}
                 await waitForTabComplete(tab.id, 30000);
                 try{ const activeRetry=await getActiveGedmatchTabId(tab.id); if(activeRetry!==tab.id){ tab.id=activeRetry; } }catch(_e){}
@@ -3250,9 +3269,9 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
                   const adjustRes = await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{
                     const emailNeedle='cases@othram.com';
                     let unchecked=0;
-                    try{ const selAll=document.querySelector('input.form-checkbox[title="Select all rows in this table"]'); if(selAll && !selAll.checked){ selAll.click(); selAll.checked=true; selAll.dispatchEvent(new Event('change',{bubbles:true})); } }catch(_e){}
+                    try{ const selAll=document.querySelector('input[type=\"checkbox\"][title=\"Select all rows in this table\"], thead input[type=\"checkbox\"]'); if(selAll && !selAll.checked){ selAll.click(); selAll.checked=true; selAll.dispatchEvent(new Event('change',{bubbles:true})); } }catch(_e){}
                     const rows=Array.from(document.querySelectorAll('table tbody tr'));
-                    for(const tr of rows){ const txt=(tr.textContent||'').toLowerCase(); if(txt.includes(emailNeedle)){ const cb=tr.querySelector('input.form-checkbox'); if(cb && cb.checked){ cb.click(); cb.checked=false; cb.dispatchEvent(new Event('change',{bubbles:true})); unchecked++; } } }
+                    for(const tr of rows){ const txt=(tr.textContent||'').toLowerCase(); if(txt.includes(emailNeedle)){ const cb=tr.querySelector('input[type=\"checkbox\"]'); if(cb && cb.checked){ cb.click(); cb.checked=false; cb.dispatchEvent(new Event('change',{bubbles:true})); unchecked++; } } }
                     try{ if(typeof Drupal!=='undefined' && Drupal.attachBehaviors){ Drupal.attachBehaviors(document, (window.drupalSettings||{})); } }catch(_e){}
                     return { unchecked };
                   }});
@@ -3261,7 +3280,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
                   try{ await navLog(kit,{ area:'reports', step:'optout-unchecked', count:uncheckResult.unchecked||0 }); }catch(_e){}
                 }catch(_e){}
                 // Re-click Visualization Options
-                try{ await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{ const vis=document.querySelector('#edit-multi-kit-analysis-submit'); if(vis){ vis.click(); } }}); }catch(_e){}
+                try{ await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{ const vis=document.querySelector('#edit-multi-kit-analysis-submit, [data-drupal-selector="edit-multi-kit-analysis-submit"], input.btn-visualization#edit-multi-kit-analysis-submit, input[type="submit"][value="Visualization"]'); if(vis){ vis.click(); } }}); }catch(_e){}
                 try{ await navLog(kit,{ area:'reports', step:'vis-options-retry-click' }); }catch(_e){}
                 await waitForTabComplete(tab.id, 30000);
                 try{ const activeRetry=await getActiveGedmatchTabId(tab.id); if(activeRetry!==tab.id){ tab.id=activeRetry; } }catch(_e){}
@@ -3405,8 +3424,8 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
                   if(!link){
                     try{
                       const doc=new DOMParser().parseFromString(text, 'text/html');
-                      const a1=[...doc.querySelectorAll('a')].find(a=>(a.textContent||'').trim()==='Click here to download file.');
-                      const a2=a1 || [...doc.querySelectorAll('a[href]')].find(a=>/\.csv(\?|$)/i.test(a.getAttribute('href')||a.href||''));
+                      const a1=[...doc.querySelectorAll('a[href]')].find(a=>/\.csv(\?|$)/i.test(a.getAttribute('href')||a.href||''));
+                      const a2=a1 || [...doc.querySelectorAll('a')].find(a=>{ const t=(a.textContent||'').toLowerCase(); return t.includes('csv file ready') || (t.includes('click here') && t.includes('download')); });
                       if(a2){ const href=a2.getAttribute('href')||a2.href||''; link = href && /^https?:/i.test(href) ? href : (href ? (new URL(href, location.origin).toString()) : ''); }
                     }catch(_e){}
                   }
@@ -3459,7 +3478,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
                         let selected=0, othramSelected=0, nonOthramSelected=0;
                         
                         // First: uncheck all
-                        try{ const selAll=document.querySelector('input.form-checkbox[title="Select all rows in this table"]'); if(selAll && selAll.checked){ selAll.click(); selAll.checked=false; selAll.dispatchEvent(new Event('change',{bubbles:true})); } }catch(_e){}
+                        try{ const selAll=document.querySelector('input[type="checkbox"][title="Select all rows in this table"], thead input[type="checkbox"]'); if(selAll && selAll.checked){ selAll.click(); selAll.checked=false; selAll.dispatchEvent(new Event('change',{bubbles:true})); } }catch(_e){}
                         
                         const rows = Array.from(document.querySelectorAll('table tbody tr'));
                         
@@ -3467,7 +3486,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
                         for(const tr of rows){
                           const txt = (tr.textContent||'').toLowerCase();
                           if(txt.includes(emailNeedle)){
-                            const cb = tr.querySelector('input.form-checkbox');
+                            const cb = tr.querySelector('input[type="checkbox"]');
                             if(cb && !cb.checked){ cb.click(); cb.checked=true; cb.dispatchEvent(new Event('change',{bubbles:true})); othramSelected++; selected++; }
                           }
                         }
@@ -3482,7 +3501,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
                           if(!kitMatch) continue;
                           const kitId = kitMatch[1].toUpperCase();
                           if(optedOutSet.has(kitId)) continue; // skip opted-out
-                          const cb = tr.querySelector('input.form-checkbox');
+                          const cb = tr.querySelector('input[type="checkbox"]');
                           if(cb && !cb.checked){ cb.click(); cb.checked=true; cb.dispatchEvent(new Event('change',{bubbles:true})); nonOthramSelected++; selected++; }
                         }
                         
@@ -3495,7 +3514,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
                     }catch(_e){ console.warn('[Reports] Additional segments selection failed:', _e); }
                     
                     // Click Visualization Options again
-                    try{ await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{ const vis=document.querySelector('#edit-multi-kit-analysis-submit'); if(vis){ vis.click(); } }}); }catch(_e){}
+                    try{ await chrome.scripting.executeScript({ target:{ tabId: tab.id, allFrames:false }, func:()=>{ const vis=document.querySelector('#edit-multi-kit-analysis-submit, [data-drupal-selector="edit-multi-kit-analysis-submit"], input.btn-visualization#edit-multi-kit-analysis-submit, input[type="submit"][value="Visualization"]'); if(vis){ vis.click(); } }}); }catch(_e){}
                     try{ await navLog(kit,{ area:'reports', step:'additional-segments-vis-click' }); }catch(_e){}
                     await waitForTabComplete(tab.id, 30000);
                     try{ const activeVis=await getActiveGedmatchTabId(tab.id); if(activeVis!==tab.id){ tab.id=activeVis; } }catch(_e){}
