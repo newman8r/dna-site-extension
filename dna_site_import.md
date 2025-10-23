@@ -135,13 +135,25 @@ Enhancements (NEW):
 - This requires `"debugger"` permission and is only used on explicit user action.
 
 ### Post‑submit link rendering and download
-- When the button reveals a link rather than triggering a download, we wait briefly and scan the DOM for:
-  - Exact “Click here to download file.” anchor; or
-  - Any link ending with `.csv`.
+- When the button reveals a link, or when the new UI auto‑inserts a link without a direct download, we wait briefly and scan the DOM for:
+  - Any anchor whose `href` ends with `.csv` (preferred),
+  - New text variant: “Csv file ready. If download doesn’t start automatically, click here.”, or
+  - Legacy text: “Click here to download file.”
 - If not found (some responses are Drupal AJAX JSON), we also parse the POST response body in page context:
-  - If it’s a Drupal AJAX array of commands, we parse `insert` markup and extract the CSV href.
-  - Else, parse returned HTML to find `<a href=...csv>`.
-- When a link is resolved, we fetch and store the CSV in `chrome.storage.local` under `gmReportsFiles` with bytes and metadata.
+  - If it’s a Drupal AJAX array of commands, we parse `insert` markup and extract the CSV `href`.
+  - Else, parse returned HTML and prefer `<a href="...csv">`, falling back to known link texts above.
+- When a link is resolved, we normalize relative URLs against the current origin, fetch with `credentials: 'include'`, and store the CSV in `chrome.storage.local` under `gmReportsFiles` with bytes and metadata.
+
+### 2025‑10 GEDmatch UI changes (NEW)
+- One‑to‑Many “Download CSV” trigger:
+  - The page now uses a JS‑heavy flow that may auto‑download and/or render a link without a traditional click. We first check the page for any `.csv` anchor; only if absent do we attempt to click.
+  - Click strategy: try legacy selectors (`#edit-download-csv`, `[data-drupal-selector="edit-download-csv"]`), then fall back to any visible button/input/anchor whose text/value includes “Download CSV”.
+  - The new link text often reads: `Csv file ready. If download doesn’t start automatically, click here.` and appears as an anchor like `<a href="/sites/default/files/tools/.../one-to-many-autosomal*.csv">…</a>`.
+- Visualization button:
+  - The button is now an input submit (e.g., `input.btn-visualization#edit-multi-kit-analysis-submit`) with `data-drupal-selector="edit-multi-kit-analysis-submit"`. We target a robust selector set including `#edit-multi-kit-analysis-submit`, `[data-drupal-selector="edit-multi-kit-analysis-submit"]`, and `input[type="submit"][value="Visualization"]`.
+- Results table selection changes:
+  - The table markup and controls changed; the master “Select all rows” checkbox in the header may be absent. Our selection logic first tries the master checkbox (if present), otherwise manually clicks each row’s checkbox (`table tbody input[type="checkbox"]`, e.g., ids starting with `edit-multi-kit-analysis-kits-` or names like `multi_kit_analysis[kits][...]`).
+  - The same generalized checkbox handling is used in opt‑out retries (unchecking `cases@othram.com`) and in the “additional segments” selection pass.
 
 Additional notes (NEW):
 - The same POST/JSON/HTML extraction logic is used for both the primary and the additional segments CSV.

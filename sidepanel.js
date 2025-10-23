@@ -2006,7 +2006,7 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
         const tab=await chrome.tabs.create({ url:cand.href, active:false });
         await waitForTabComplete(tab.id, 20000);
         const pre=await extractPreFromTabId(tab.id);
-        if(!isPedigreeUrl(pre?.frame||'') || !samePedigreeTarget(cand.href, pre.frame)){ await chrome.tabs.remove(tab.id); visited.add(cand.key); continue; }
+        if(!isPedigreeUrl(pre?.frame||'') || !samePedigreeTarget(cand.href, pre.frame)){ await chrome.tabs.remove(tab.id); visited.add(cand.key); await new Promise(r=>setTimeout(r,1000)); continue; }
         const rows2=buildIntermediaryRows(pre);
         const built2=buildFamiliesFromRowsV9(rows2);
         // choose the extended overlap person directly using candidate hint (inside the extended page)
@@ -2016,14 +2016,15 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
         const keyMatchedBaseId = findBaseIdByCandidateKey({ people: baseGraph.people, families: baseGraph.families }, cand);
         const hintedId = keyMatchedBaseId!=null ? keyMatchedBaseId : ((cand.rowIdx!=null && rowToId.has(cand.rowIdx)) ? rowToId.get(cand.rowIdx) : null);
         const overlapBaseId = findLikelyOverlapBaseId({ people: baseGraph.people, families: baseGraph.families }, { people: built2.people, families: built2.families }, hintedId, cand);
-        if(overlapBaseId!=null && alreadyUsed.has(overlapBaseId)){ visited.add(cand.key); await chrome.tabs.remove(tab.id); continue; }
+        if(overlapBaseId!=null && alreadyUsed.has(overlapBaseId)){ visited.add(cand.key); await chrome.tabs.remove(tab.id); await new Promise(r=>setTimeout(r,1000)); continue; }
         const res=mergeExtendedIntoBase(baseGraph, { people: built2.people, families: built2.families, extRootOverride: extOverlapId }, overlapBaseId);
-        if(res.skipped==='hidden-root'){ skippedHidden++; visited.add(cand.key); await chrome.tabs.remove(tab.id); continue; }
-        if(res.skipped==='no-overlap'){ visited.add(cand.key); await chrome.tabs.remove(tab.id); continue; }
+        if(res.skipped==='hidden-root'){ skippedHidden++; visited.add(cand.key); await chrome.tabs.remove(tab.id); await new Promise(r=>setTimeout(r,1000)); continue; }
+        if(res.skipped==='no-overlap'){ visited.add(cand.key); await chrome.tabs.remove(tab.id); await new Promise(r=>setTimeout(r,1000)); continue; }
         baseGraph=res.graph; mergedCount++; visited.add(cand.key);
         // track which base ids have an extension attached
         const updatedCapAll=await chrome.storage.local.get(['gmCapturedByKit']); const allCaps=updatedCapAll.gmCapturedByKit||{}; const thisCap=allCaps[kit]||cap; const att=new Set(Array.isArray(thisCap.extendedAttachedTo)?thisCap.extendedAttachedTo:[]); if(overlapBaseId!=null) att.add(overlapBaseId); thisCap.extendedAttachedTo=Array.from(att); allCaps[kit]=thisCap; await chrome.storage.local.set({ gmCapturedByKit: allCaps });
         await chrome.tabs.remove(tab.id);
+        await new Promise(r=>setTimeout(r,1000));
       } catch(e){ try{ if(e?.tab?.id) await chrome.tabs.remove(e.tab.id); }catch(_e){} visited.add(cand.key); }
     }
     // Rebuild GEDCOM from merged graph
@@ -3449,6 +3450,14 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
                 await updateBundleUi();
                 try{ await navLog(kit,{ area:'reports', step:'segments-fetched', filename:name, bytes: bytes.length }); }catch(_e){}
                 renderReportsLog();
+              // If Skip Auto-Kinship is enabled, finish here (auto-save bundle with two CSVs)
+              try{
+                const skipAkActive = !!(document.getElementById('skipAutoKinship')?.checked) && autoRunState.userInitiated === false;
+                if(skipAkActive){
+                  try{ await navLog(kit,{ area:'reports', step:'skip-autokinship-enabled' }); }catch(_e){}
+                  return; // Do not proceed to additional segments or Auto-Kinship
+                }
+              }catch(_e){}
                 
                 // Check if we need to capture additional segments (opted-in kits only)
                 if(needsAdditionalSegments && optedOutKits && optedOutKits.size > 0){
@@ -4035,36 +4044,39 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
     const isSeg =(f)=> f?.kind==='segments' || /segment|match/i.test((f?.name||''));
     const isAk  =(f)=> f?.kind==='autokinship' || /autokinship|\.zip$/i.test((f?.name||''));
     const one = latest(isOne); const seg = latest(isSeg); const ak = latest(isAk);
-    if(!(one && seg && ak)) throw new Error('Bundle not ready');
+    const skipAk = !!(document.getElementById('skipAutoKinship')?.checked);
+    if(!(one && seg && (skipAk || ak))) throw new Error('Bundle not ready');
     const enc = new TextEncoder(); const files=[];
     if(one?.data) files.push({ name: one.name||'one-to-many.csv', data:new Uint8Array(one.data) });
     if(seg?.data) files.push({ name: seg.name||'segments.csv', data:new Uint8Array(seg.data) });
-    
-    // For Auto-Kinship: try to fetch if we have URL, fallback to data, or include URL text file
-    let akAdded=false;
-    // Try with data first if available
-    if(ak?.data) { 
-      files.push({ name: (ak.name||'AutoKinship.zip').replace(/\?.*$/,''), data:new Uint8Array(ak.data) }); 
-      akAdded=true; 
-    }
-    // If no data, try to fetch the URL (S3 presigned URLs don't need credentials)
-    if(!akAdded && ak?.url){ 
-      try{ 
-        // Don't use credentials for S3 URLs - they're presigned
-        const r=await fetch(ak.url); 
-        const ok = r?.ok && (/zip/i.test(r.headers.get('content-type')||'') || /\.zip(\?|$)/i.test(ak.url)); 
-        if(ok){ 
-          const b=new Uint8Array(await (await r.blob()).arrayBuffer()); 
-          files.push({ name:(ak.name||'AutoKinship.zip').replace(/\?.*$/,''), data:b }); 
-          akAdded=true; 
+
+    if(!skipAk){
+      // For Auto-Kinship: try to fetch if we have URL, fallback to data, or include URL text file
+      let akAdded=false;
+      // Try with data first if available
+      if(ak?.data) { 
+        files.push({ name: (ak.name||'AutoKinship.zip').replace(/\?.*$/,''), data:new Uint8Array(ak.data) }); 
+        akAdded=true; 
+      }
+      // If no data, try to fetch the URL (S3 presigned URLs don't need credentials)
+      if(!akAdded && ak?.url){ 
+        try{ 
+          // Don't use credentials for S3 URLs - they're presigned
+          const r=await fetch(ak.url); 
+          const ok = r?.ok && (/zip/i.test(r.headers.get('content-type')||'') || /\.zip(\?|$)/i.test(ak.url)); 
+          if(ok){ 
+            const b=new Uint8Array(await (await r.blob()).arrayBuffer()); 
+            files.push({ name:(ak.name||'AutoKinship.zip').replace(/\?.*$/,''), data:b }); 
+            akAdded=true; 
+          } 
+        }catch(_e){
+          console.warn('Failed to fetch Auto-Kinship ZIP from URL:', _e);
         } 
-      }catch(_e){
-        console.warn('Failed to fetch Auto-Kinship ZIP from URL:', _e);
-      } 
-    }
-    // Last resort: include URL as text file
-    if(!akAdded && ak?.url){ 
-      files.push({ name:'AutoKinship_URL.txt', data: enc.encode(ak.url) }); 
+      }
+      // Last resort: include URL as text file
+      if(!akAdded && ak?.url){ 
+        files.push({ name:'AutoKinship_URL.txt', data: enc.encode(ak.url) }); 
+      }
     }
     if(!files.length) throw new Error('No files');
     function dosDateTime(dt){ const d=dt||new Date(); const time=(d.getHours()<<11)|(d.getMinutes()<<5)|((d.getSeconds()/2)|0); const date=((d.getFullYear()-1980)<<9)|((d.getMonth()+1)<<5)|d.getDate(); return {time,date}; }
@@ -4102,7 +4114,8 @@ function refreshStatusDots(profiles, statusByKit){ renderList(profiles, statusBy
       const hasOne = files.some(f=>f?.kind==='one-to-many' || /one-to-many/i.test(f?.name||''));
       const hasSeg = files.some(f=>f?.kind==='segments' || /segment|match/i.test(f?.name||''));
       const hasAk  = files.some(f=>f?.kind==='autokinship' || /autokinship|\.zip$/i.test(f?.name||''));
-      if(hasOne && hasSeg && hasAk){
+      const skipAk = !!(document.getElementById('skipAutoKinship')?.checked);
+      if(hasOne && hasSeg && (hasAk || skipAk)){
         const d=new Date(); const m=d.getMonth()+1; const day=d.getDate(); const yyyy=d.getFullYear(); const ocn=(store?.gmOcn||'').trim(); const prefix=ocn?`${ocn}_`:''; const fname=kit?`${prefix}${kit}_gmp_${m}-${day}-${yyyy}.zip`:'bundle.zip';
         status.textContent = `Ready: ${fname}`;
         btn.disabled=false;
